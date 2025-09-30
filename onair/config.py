@@ -19,6 +19,7 @@ class OnAirConfig:
 	max_retries: int
 	db_path: str
 	run_mode: str
+	airport_cache_days: int
 
 	@property
 	def base_url(self) -> str:
@@ -30,6 +31,7 @@ class OnAirConfig:
 
 _def_timeout = int(os.getenv("ONAIR_TIMEOUT_SECONDS", "30"))
 _def_retries = int(os.getenv("ONAIR_MAX_RETRIES", "3"))
+_def_airport_cache_days = int(os.getenv("ONAIR_AIRPORT_CACHE_DAYS", "90"))
 
 
 def load_config() -> OnAirConfig:
@@ -54,4 +56,5 @@ def load_config() -> OnAirConfig:
 		max_retries=_def_retries,
 		db_path=db_path,
 		run_mode=run_mode,
+		airport_cache_days=_def_airport_cache_days,
 	)

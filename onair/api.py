@@ -25,6 +25,16 @@ def _extract_list_payload(data: Any) -> Optional[List[Dict[str, Any]]]:
 	return None
 
 
+def _extract_object_payload(data: Any) -> Optional[Dict[str, Any]]:
+	if isinstance(data, dict):
+		for key in ("Content", "Data", "Item", "data", "item", "result", "Result"):
+			val = data.get(key)
+			if isinstance(val, dict):
+				return val
+		return data
+	return None
+
+
 class OnAirClient:
 	def __init__(self, config: OnAirConfig):
 		self._config = config
@@ -118,3 +128,20 @@ class OnAirClient:
 				continue
 			raise OnAirApiError(f"Unexpected response for {p}: {resp.status_code} {resp.text}")
 		return []
+
+	def get_airport_by_icao(self, icao: str) -> Dict[str, Any]:
+		icao = (icao or "").strip().upper()
+		paths = [
+			f"/airport/{icao}",
+			f"/airports/{icao}",
+		]
+		for p in paths:
+			resp = self._request("GET", p)
+			if resp.status_code == 200:
+				data = _extract_object_payload(resp.json())
+				if data is not None:
+					return data
+			elif resp.status_code == 404:
+				continue
+			raise OnAirApiError(f"Unexpected response for {p}: {resp.status_code} {resp.text}")
+		raise OnAirApiError(f"Airport not found: {icao}")

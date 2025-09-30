@@ -1,5 +1,6 @@
 import argparse
 import sys
+from typing import Dict, Iterable, Set, Any
 
 from onair.config import load_config
 from onair.api import OnAirClient, OnAirApiError
@@ -21,6 +22,66 @@ def _print_db_stats(db_path: str) -> None:
 		conn.close()
 
 
+def _maybe_add_icao(val: Any, seen: Set[str]) -> None:
+	if isinstance(val, str):
+		code = val.strip().upper()
+		if len(code) >= 2:
+			seen.add(code)
+
+
+def _recurse_for_icaos(obj: Any, seen: Set[str]) -> None:
+	if isinstance(obj, dict):
+		# Prefer explicit ICAO fields on objects
+		for k in ("ICAO", "icao", "Icao"):
+			if k in obj and isinstance(obj[k], str):
+				_maybe_add_icao(obj[k], seen)
+		for v in obj.values():
+			_recurse_for_icaos(v, seen)
+	elif isinstance(obj, list):
+		for it in obj:
+			_recurse_for_icaos(it, seen)
+
+
+def _collect_icaos_from_jobs(jobs: Iterable[Dict]) -> Set[str]:
+	seen: Set[str] = set()
+	for job in jobs:
+		# Common direct fields
+		for key in ("Departure", "Destination", "departure", "destination"):
+			val = job.get(key)
+			if isinstance(val, str):
+				_maybe_add_icao(val, seen)
+		# Cargos legs often include airports with ICAO fields
+		for cargo_key in ("Cargos", "cargos"):
+			cargos = job.get(cargo_key) or []
+			if isinstance(cargos, list):
+				for cg in cargos:
+					for ap_key in ("CurrentAirport", "DepartureAirport", "DestinationAirport", "Airport"):
+						ap = isinstance(cg, dict) and cg.get(ap_key) or None
+						if isinstance(ap, dict):
+							icao = ap.get("ICAO") or ap.get("icao")
+							if isinstance(icao, str):
+								_maybe_add_icao(icao, seen)
+		# Generic recursive search as fallback
+		_recurse_for_icaos(job, seen)
+	return seen
+
+
+def _ensure_airports_cached(cfg, client: OnAirClient, icaos: Set[str]) -> int:
+	cached_or_fetched = 0
+	for icao in sorted(icaos):
+		if not icao:
+			continue
+		if not dbmod.is_airport_stale(cfg.db_path, icao, cfg.airport_cache_days):
+			cached_or_fetched += 1
+			continue
+		ap = client.get_airport_by_icao(icao)
+		if isinstance(ap, dict) and "Airport" in ap and isinstance(ap["Airport"], dict):
+			ap = ap["Airport"]
+		dbmod.upsert_airport(cfg.db_path, ap)
+		cached_or_fetched += 1
+	return cached_or_fetched
+
+
 def main(argv=None) -> int:
 	cfg = load_config()
 	parser = argparse.ArgumentParser(description="Fetch OnAir jobs into SQLite")
@@ -35,10 +96,19 @@ def main(argv=None) -> int:
 	dbmod.init_db(cfg.db_path)
 	client = OnAirClient(cfg)
 
+	# Clear jobs table each online run for a fresh snapshot
+	import sqlite3
+	with sqlite3.connect(cfg.db_path) as conn:
+		conn.execute("DELETE FROM jobs")
+		conn.commit()
+
 	inserted = 0
+	icaos: Set[str] = set()
+
 	if args.scope in ("company", "all"):
 		jobs = client.list_company_jobs()
 		inserted += dbmod.upsert_jobs(cfg.db_path, jobs, source="company")
+		icaos.update(_collect_icaos_from_jobs(jobs))
 
 	if args.scope in ("fbos", "all"):
 		fbos = client.list_fbos()
@@ -48,8 +118,12 @@ def main(argv=None) -> int:
 				continue
 			jobs = client.list_fbo_jobs(str(fbo_id))
 			inserted += dbmod.upsert_jobs(cfg.db_path, jobs, source=f"fbo:{fbo_id}")
+			icaos.update(_collect_icaos_from_jobs(jobs))
+
+	cached = _ensure_airports_cached(cfg, client, icaos)
 
 	print(f"Upserted {inserted} jobs into {cfg.db_path}")
+	print(f"Airports referenced: {len(icaos)}; cached (existing+fetched): {cached}")
 	return 0
 
 
