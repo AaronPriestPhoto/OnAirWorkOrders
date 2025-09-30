@@ -1,219 +1,244 @@
-import argparse
-import math
 import sys
-from typing import Dict, Iterable, Set, Any, List, Tuple
+import os
+import argparse
+import json
+import math
+from datetime import datetime, timedelta
 
-from onair.config import load_config
-from onair.api import OnAirClient, OnAirApiError
-from onair import db as dbmod
+# Add the project root to the Python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from onair import config as cfg_mod
+from onair import api as api_mod
+from onair import db as db_mod
 
 
-def _print_db_stats(db_path: str) -> None:
-	import sqlite3
-	conn = sqlite3.connect(db_path)
-	try:
+def _print_offline_stats(db_path: str) -> None:
+	with db_mod.connect(db_path) as conn:
 		c = conn.cursor()
-		c.execute("select count(*) from jobs")
-		total = c.fetchone()[0]
-		print(f"Total jobs: {total}")
-		print("By source:")
-		for src, cnt in c.execute("select source, count(*) from jobs group by source order by count(*) desc"):
-			print(f"  {src}: {cnt}")
-		c.execute("select count(*) from airplanes")
-		print(f"Airplanes: {c.fetchone()[0]}")
-		try:
-			c.execute("select count(*) from job_legs")
-			print(f"Job legs: {c.fetchone()[0]}")
-		except Exception:
-			pass
-	finally:
-		conn.close()
-
-
-def _maybe_add_icao(val: Any, seen: Set[str]) -> None:
-	if isinstance(val, str):
-		code = val.strip().upper()
-		if len(code) >= 2:
-			seen.add(code)
-
-
-def _recurse_for_icaos(obj: Any, seen: Set[str]) -> None:
-	if isinstance(obj, dict):
-		for k in ("ICAO", "icao", "Icao"):
-			if k in obj and isinstance(obj[k], str):
-				_maybe_add_icao(obj[k], seen)
-		for v in obj.values():
-			_recurse_for_icaos(v, seen)
-	elif isinstance(obj, list):
-		for it in obj:
-			_recurse_for_icaos(it, seen)
-
-
-def _collect_icaos_from_jobs(jobs: Iterable[Dict]) -> Set[str]:
-	seen: Set[str] = set()
-	for job in jobs:
-		for key in ("Departure", "Destination", "departure", "destination"):
-			val = job.get(key)
-			if isinstance(val, str):
-				_maybe_add_icao(val, seen)
-		for cargo_key in ("Cargos", "cargos"):
-			cargos = job.get(cargo_key) or []
-			if isinstance(cargos, list):
-				for cg in cargos:
-					for ap_key in ("CurrentAirport", "DepartureAirport", "DestinationAirport", "Airport"):
-						ap = isinstance(cg, dict) and cg.get(ap_key) or None
-						if isinstance(ap, dict):
-							icao = ap.get("ICAO") or ap.get("icao")
-							if isinstance(icao, str):
-								_maybe_add_icao(icao, seen)
-		_recurse_for_icaos(job, seen)
-	return seen
+		def _count(table: str) -> int:
+			row = c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+			return int(row[0]) if row else 0
+		jobs = _count("jobs")
+		airports = _count("airports")
+		airplanes = _count("airplanes")
+		job_legs = _count("job_legs")
+		print(f"Total jobs: {jobs}")
+		if jobs > 0:
+			for row in c.execute('SELECT source, COUNT(*) FROM jobs GROUP BY source ORDER BY COUNT(*) DESC'):
+				print(f"  {row[0]}: {row[1]}")
+		print(f"Airports cached: {airports}")
+		print(f"Airplanes cached: {airplanes}")
+		print(f"Job legs stored: {job_legs}")
 
 
 def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-	# Earth radius nautical miles
 	R = 3440.065
 	phi1 = math.radians(lat1)
 	phi2 = math.radians(lat2)
 	dphi = math.radians(lat2 - lat1)
 	dlam = math.radians(lon2 - lon1)
-	a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
+	a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam/2)**2
 	c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 	return R * c
 
 
-def _extract_job_legs(job: Dict[str, Any]) -> List[Tuple[str, str]]:
-	legs: List[Tuple[str, str]] = []
-	# Prefer cargos sequence if present
-	cargos = job.get("Cargos") or job.get("cargos")
-	if isinstance(cargos, list) and len(cargos) > 0:
-		# Group cargos by sequence of airports if available
-		seq: List[str] = []
-		for cg in cargos:
-			dep = None
-			dst = None
-			dep_ap = isinstance(cg, dict) and (cg.get("DepartureAirport") or cg.get("CurrentAirport"))
-			dst_ap = isinstance(cg, dict) and cg.get("DestinationAirport")
-			if isinstance(dep_ap, dict):
-				dep = dep_ap.get("ICAO") or dep_ap.get("icao")
-			if isinstance(dst_ap, dict):
-				dst = dst_ap.get("ICAO") or dst_ap.get("icao")
-			if isinstance(dep, str):
-				seq.append(dep.strip().upper())
-			if isinstance(dst, str):
-				seq.append(dst.strip().upper())
-		# Collapse into legs
-		for i in range(len(seq) - 1):
-			legs.append((seq[i], seq[i+1]))
-	# Fallback to overall departure/destination
-	dep = job.get("Departure") or job.get("departure")
-	dst = job.get("Destination") or job.get("destination")
-	if isinstance(dep, str) and isinstance(dst, str):
-		legs.append((dep.strip().upper(), dst.strip().upper()))
+def _extract_legs_from_job(job: dict) -> list[dict]:
+	legs: list[dict] = []
+	job_id = job.get('Id') or job.get('id') or job.get('JobId')
+	cargo_weight = job.get('TotalCargoWeight') or job.get('CargoWeight') or job.get('Cargo') or 0.0
+	if job.get('Cargos'):
+		for idx, cargo in enumerate(job['Cargos']):
+			f = (cargo.get('DepartureAirport') or {}).get('ICAO')
+			t = (cargo.get('DestinationAirport') or {}).get('ICAO')
+			w = cargo.get('Weight') or 0.0
+			if f and t:
+				legs.append({"job_id": job_id, "leg_index": idx, "from_icao": f, "to_icao": t, "cargo_lbs": w})
+	elif job.get('Charters'):
+		for idx, ch in enumerate(job['Charters']):
+			f = (ch.get('DepartureAirport') or {}).get('ICAO')
+			t = (ch.get('DestinationAirport') or {}).get('ICAO')
+			if f and t:
+				legs.append({"job_id": job_id, "leg_index": idx, "from_icao": f, "to_icao": t, "cargo_lbs": 0.0})
+	else:
+		f = job.get('Departure') or job.get('departure')
+		t = job.get('Destination') or job.get('destination')
+		if f and t:
+			legs.append({"job_id": job_id, "leg_index": 0, "from_icao": f, "to_icao": t, "cargo_lbs": cargo_weight})
 	return legs
 
 
-def _compute_and_store_leg_distances(cfg, jobs: Iterable[Dict[str, Any]]) -> int:
-	count = 0
-	# Clear legs before recompute
-	dbmod.clear_job_legs(cfg.db_path)
-	for job in jobs:
-		job_id = job.get("Id") or job.get("id") or job.get("JobId")
-		if not job_id:
-			continue
-		pairs = _extract_job_legs(job)
-		total_nm = 0.0
-		leg_index = 0
-		for a, b in pairs:
-			if not a or not b:
+def _build_job_legs_and_distances(db_path: str) -> int:
+	"""Parse stored job JSON, build legs, compute distances, and update totals."""
+	# Clear existing legs
+	db_mod.clear_job_legs(db_path)
+	inserted = 0
+	with db_mod.connect(db_path) as conn:
+		cur = conn.cursor()
+		rows = cur.execute("SELECT id, data_json FROM jobs").fetchall()
+		for row in rows:
+			job_id = row[0]
+			try:
+				job = json.loads(row[1])
+			except Exception:
 				continue
-			a_ap = dbmod.get_airport(cfg.db_path, a)
-			b_ap = dbmod.get_airport(cfg.db_path, b)
-			if not a_ap or not b_ap or a_ap.get("latitude") is None or a_ap.get("longitude") is None or b_ap.get("latitude") is None or b_ap.get("longitude") is None:
-				continue
-			d_nm = _haversine_nm(float(a_ap["latitude"]), float(a_ap["longitude"]), float(b_ap["latitude"]), float(b_ap["longitude"]))
-			dbmod.upsert_job_leg(cfg.db_path, str(job_id), leg_index, a, b, float(a_ap["latitude"]), float(a_ap["longitude"]), float(b_ap["latitude"]), float(b_ap["longitude"]), float(d_nm))
-			total_nm += d_nm
-			leg_index += 1
-		if leg_index > 0:
-			dbmod.update_job_total_distance(cfg.db_path, str(job_id), float(total_nm))
-			count += leg_index
-	return count
+			legs = _extract_legs_from_job(job)
+			total_nm = 0.0
+			for leg in legs:
+				f = leg["from_icao"].strip().upper()
+				t = leg["to_icao"].strip().upper()
+				ap_from = cur.execute("SELECT latitude, longitude FROM airports WHERE icao = ?", (f,)).fetchone()
+				ap_to = cur.execute("SELECT latitude, longitude FROM airports WHERE icao = ?", (t,)).fetchone()
+				from_lat = ap_from[0] if ap_from else None
+				from_lon = ap_from[1] if ap_from else None
+				to_lat = ap_to[0] if ap_to else None
+				to_lon = ap_to[1] if ap_to else None
+				dist = 0.0
+				if from_lat is not None and from_lon is not None and to_lat is not None and to_lon is not None:
+					dist = _haversine_nm(from_lat, from_lon, to_lat, to_lon)
+				db_mod.upsert_job_leg(db_path, leg["job_id"], leg["leg_index"], f, t, from_lat or 0.0, from_lon or 0.0, to_lat or 0.0, to_lon or 0.0, dist, leg.get("cargo_lbs"))
+				total_nm += dist
+			inserted += len(legs)
+			db_mod.update_job_total_distance(db_path, job_id, total_nm)
+	return inserted
 
 
-def _ensure_airports_cached(cfg, client: OnAirClient, icaos: Set[str]) -> int:
-	cached_or_fetched = 0
-	for icao in sorted(icaos):
-		if not icao:
-			continue
-		if not dbmod.is_airport_stale(cfg.db_path, icao, cfg.airport_cache_days):
-			cached_or_fetched += 1
-			continue
-		ap = client.get_airport_by_icao(icao)
-		if isinstance(ap, dict) and "Airport" in ap and isinstance(ap["Airport"], dict):
-			ap = ap["Airport"]
-		dbmod.upsert_airport(cfg.db_path, ap)
-		cached_or_fetched += 1
-	return cached_or_fetched
+def main():
+	parser = argparse.ArgumentParser(description="Fetch jobs from OnAir API and store in SQLite.")
+	parser.add_argument("--mode", type=str, choices=["online", "offline"],
+					help="Run mode: 'online' to fetch from API, 'offline' to use cached data.")
+	parser.add_argument("--scope", type=str, choices=["all", "company", "fbos"], default="all",
+					help="Scope of jobs to fetch: 'all' (company + FBOs), 'company', or 'fbos'.")
+	args = parser.parse_args()
 
+	config = cfg_mod.load_config()
+	db_mod.init_db(config.db_path)
+	db_mod.migrate_schema(config.db_path)
+	client = api_mod.OnAirClient(config)
 
-def main(argv=None) -> int:
-	cfg = load_config()
-	parser = argparse.ArgumentParser(description="Fetch OnAir jobs into SQLite")
-	parser.add_argument("--scope", choices=["company", "fbos", "all"], default="all", help="Which job scope to fetch")
-	parser.add_argument("--mode", choices=["online", "offline"], default=cfg.run_mode, help="Run mode: online hits API, offline uses cached DB only")
-	args = parser.parse_args(argv)
+	run_mode = args.mode if args.mode else config.run_mode
 
-	if args.mode == "offline":
-		_print_db_stats(cfg.db_path)
+	if run_mode == 'offline':
+		print("Running in OFFLINE mode. Using cached data only.")
+		_print_offline_stats(config.db_path)
+		# Try to build legs from existing data too
+		built = _build_job_legs_and_distances(config.db_path)
+		print(f"Rebuilt job legs from cache: {built}")
+		# Verify all ICAOs for legs have airport rows
+		with db_mod.connect(config.db_path) as conn:
+			missing = _verify_airports_for_jobs(conn)
+			if missing:
+				print(f"WARNING: {len(missing)} ICAOs referenced in jobs are missing in airports (offline): {', '.join(sorted(missing))}")
 		return 0
 
-	dbmod.init_db(cfg.db_path)
-	dbmod.migrate_schema(cfg.db_path)
-	client = OnAirClient(cfg)
-
-	# Clear jobs and airplanes tables each online run for a fresh snapshot
-	import sqlite3
-	with sqlite3.connect(cfg.db_path) as conn:
-		conn.execute("DELETE FROM jobs")
-		conn.execute("DELETE FROM airplanes")
+	print("Running in ONLINE mode. Fetching fresh data from API.")
+	
+	# Clear tables for fresh data in online mode
+	with db_mod.connect(config.db_path) as conn:
+		conn.execute('DELETE FROM jobs')
+		conn.execute('DELETE FROM job_legs')
+		conn.execute('DELETE FROM airplanes')
 		conn.commit()
 
-	inserted = 0
-	icaos: Set[str] = set()
-	all_jobs: List[Dict[str, Any]] = []
+	all_jobs = []
+	
+	# Fetch company jobs
+	if args.scope in ["all", "company"]:
+		print("Fetching company jobs...")
+		company_jobs = client.list_company_jobs()
+		all_jobs.extend(company_jobs)
+		inserted = db_mod.upsert_jobs(config.db_path, company_jobs, source="company")
+		print(f"Upserted {inserted} company jobs.")
 
-	if args.scope in ("company", "all"):
-		jobs = client.list_company_jobs()
-		all_jobs.extend(jobs)
-		inserted += dbmod.upsert_jobs(cfg.db_path, jobs, source="company")
-		icaos.update(_collect_icaos_from_jobs(jobs))
-
-	if args.scope in ("fbos", "all"):
+	# Fetch FBO jobs
+	if args.scope in ["all", "fbos"]:
+		print("Fetching FBOs...")
 		fbos = client.list_fbos()
+		print(f"Found {len(fbos)} FBOs. Fetching jobs for each...")
 		for fbo in fbos:
-			fbo_id = fbo.get("Id") or fbo.get("id") or fbo.get("FboId")
-			if not fbo_id:
-				continue
-			jobs = client.list_fbo_jobs(str(fbo_id))
-			all_jobs.extend(jobs)
-			inserted += dbmod.upsert_jobs(cfg.db_path, jobs, source=f"fbo:{fbo_id}")
-			icaos.update(_collect_icaos_from_jobs(jobs))
+			fbo_id = fbo['Id']
+			fbo_jobs = client.list_fbo_jobs(fbo_id)
+			all_jobs.extend(fbo_jobs)
+			inserted = db_mod.upsert_jobs(config.db_path, fbo_jobs, source=f"fbo:{fbo_id}")
+			print(f"Upserted {inserted} jobs for FBO {fbo['Airport']['ICAO']}.")
 
-	cached = _ensure_airports_cached(cfg, client, icaos)
+	# Fetch airplanes
+	print("Fetching company fleet...")
+	airplanes = client.list_company_fleet()
+	inserted_airplanes = db_mod.upsert_airplanes(config.db_path, airplanes)
+	print(f"Airplanes upserted: {inserted_airplanes}")
 
-	# Fetch fleet
-	fleet = client.list_company_fleet()
-	planes = dbmod.upsert_airplanes(cfg.db_path, fleet)
+	# Extract all unique ICAOs from fetched jobs (including nested legs)
+	unique_icaos = set()
+	for job in all_jobs:
+		if job.get('Departure'):
+			unique_icaos.add(job['Departure'])
+		if job.get('Destination'):
+			unique_icaos.add(job['Destination'])
+		if job.get('Cargos'):
+			for cargo in job['Cargos']:
+				if (cargo.get('DepartureAirport') or {}).get('ICAO'):
+					unique_icaos.add(cargo['DepartureAirport']['ICAO'])
+				if (cargo.get('DestinationAirport') or {}).get('ICAO'):
+					unique_icaos.add(cargo['DestinationAirport']['ICAO'])
+		if job.get('Charters'):
+			for ch in job['Charters']:
+				if (ch.get('DepartureAirport') or {}).get('ICAO'):
+					unique_icaos.add(ch['DepartureAirport']['ICAO'])
+				if (ch.get('DestinationAirport') or {}).get('ICAO'):
+					unique_icaos.add(ch['DestinationAirport']['ICAO'])
 
-	# Compute leg distances and per-job totals
-	legs_created = _compute_and_store_leg_distances(cfg, all_jobs)
+	print(f"Found {len(unique_icaos)} unique ICAOs in jobs. Checking cache...")
 
-	print(f"Upserted {inserted} jobs into {cfg.db_path}")
-	print(f"Airports referenced: {len(icaos)}; cached (existing+fetched): {cached}")
-	print(f"Airplanes upserted: {planes}")
-	print(f"Job legs stored: {legs_created}")
+	# Fetch and cache airport data
+	with db_mod.connect(config.db_path) as conn:
+		cursor = conn.cursor()
+		cached_airports_count = 0
+		fetched_airports_count = 0
+
+		for icao in unique_icaos:
+			airport_data = db_mod.get_airport(config.db_path, icao)
+			is_stale = db_mod.is_airport_stale(config.db_path, icao, config.airport_cache_days) if airport_data else True
+			if airport_data and not is_stale:
+				cached_airports_count += 1
+			else:
+				try:
+					print(f"Fetching airport data for {icao}...")
+					api_airport_data = client.get_airport_by_icao(icao)
+					db_mod.upsert_airport(config.db_path, api_airport_data)
+					fetched_airports_count += 1
+				except api_mod.OnAirApiError as e:
+					print(f"Warning: Could not fetch airport data for {icao}: {e}")
+
+		# Build legs and distances now that airports are cached
+		built = _build_job_legs_and_distances(config.db_path)
+		print(f"Job legs built: {built}")
+
+		# Post-fetch verification: ensure every ICAO exists in airports
+		missing_after_fetch = _verify_airports_for_jobs(conn)
+		if missing_after_fetch:
+			print(f"WARNING: {len(missing_after_fetch)} ICAOs referenced in jobs are missing in airports after fetch: {', '.join(sorted(missing_after_fetch))}")
+		else:
+			print("All referenced ICAOs are present in airports table.")
+
+	print(f"Airports referenced: {len(unique_icaos)}; cached (existing+fetched): {cached_airports_count + fetched_airports_count}")
+	with db_mod.connect(config.db_path) as conn:
+		print(f"Job legs stored: {conn.execute('SELECT COUNT(*) FROM job_legs').fetchone()[0]}")
+
 	return 0
+
+
+def _verify_airports_for_jobs(conn):
+	"""Return a set of ICAOs referenced by job legs that are missing in airports."""
+	missing = set()
+	for row in conn.execute('SELECT DISTINCT from_icao, to_icao FROM job_legs'):
+		for icao in (row[0], row[1]):
+			if not icao:
+				continue
+			ar = conn.execute('SELECT 1 FROM airports WHERE icao = ?', (icao,)).fetchone()
+			if not ar:
+				missing.add(icao)
+	return missing
 
 
 if __name__ == "__main__":

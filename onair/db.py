@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 	destination TEXT,
 	cargo_weight REAL,
 	pay REAL,
+	xp REAL,
 	expires_at TEXT,
 	computed_distance_nm REAL,
 	data_json TEXT NOT NULL,
@@ -62,7 +63,33 @@ CREATE TABLE IF NOT EXISTS job_legs (
 	to_lat REAL,
 	to_lon REAL,
 	distance_nm REAL,
+	cargo_lbs REAL,
 	PRIMARY KEY(job_id, leg_index)
+);
+
+CREATE TABLE IF NOT EXISTS plane_specs (
+	plane_type TEXT PRIMARY KEY,
+	cruise_speed_kts REAL,
+	min_airport_size INTEGER,
+	range1_nm REAL,
+	payload1_lbs REAL,
+	range2_nm REAL,
+	payload2_lbs REAL,
+	priority TEXT,
+	fuel_type TEXT,
+	updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS job_scores (
+	plane_id TEXT NOT NULL,
+	plane_type TEXT,
+	job_id TEXT NOT NULL,
+	feasible INTEGER NOT NULL,
+	reason TEXT,
+	pay_per_hour REAL,
+	xp_per_hour REAL,
+	balance_score REAL,
+	PRIMARY KEY(plane_id, job_id)
 );
 """
 
@@ -71,6 +98,10 @@ CREATE TABLE IF NOT EXISTS job_legs (
 def connect(db_path: str):
 	conn = sqlite3.connect(db_path)
 	try:
+		# Speed-oriented pragmas (acceptable for local app DB)
+		conn.execute("PRAGMA journal_mode=WAL")
+		conn.execute("PRAGMA synchronous=NORMAL")
+		conn.execute("PRAGMA temp_store=MEMORY")
 		yield conn
 	finally:
 		conn.close()
@@ -85,11 +116,13 @@ def init_db(db_path: str) -> None:
 def migrate_schema(db_path: str) -> None:
 	with connect(db_path) as conn:
 		c = conn.cursor()
-		# jobs.computed_distance_nm
+		# jobs additions
 		cols = [r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()]
 		if "computed_distance_nm" not in cols:
 			c.execute("ALTER TABLE jobs ADD COLUMN computed_distance_nm REAL")
-		# job_legs table
+		if "xp" not in cols:
+			c.execute("ALTER TABLE jobs ADD COLUMN xp REAL")
+		# job_legs table and columns
 		c.execute(
 			"""
 			CREATE TABLE IF NOT EXISTS job_legs (
@@ -102,7 +135,44 @@ def migrate_schema(db_path: str) -> None:
 				to_lat REAL,
 				to_lon REAL,
 				distance_nm REAL,
+				cargo_lbs REAL,
 				PRIMARY KEY(job_id, leg_index)
+			)
+			"""
+		)
+		cols_legs = [r[1] for r in c.execute("PRAGMA table_info(job_legs)").fetchall()]
+		if "cargo_lbs" not in cols_legs:
+			c.execute("ALTER TABLE job_legs ADD COLUMN cargo_lbs REAL")
+		# plane_specs
+		c.execute(
+			"""
+			CREATE TABLE IF NOT EXISTS plane_specs (
+				plane_type TEXT PRIMARY KEY,
+				cruise_speed_kts REAL,
+				min_airport_size INTEGER,
+				range1_nm REAL,
+				payload1_lbs REAL,
+				range2_nm REAL,
+				payload2_lbs REAL,
+				priority TEXT,
+				fuel_type TEXT,
+				updated_at TEXT NOT NULL
+			)
+			"""
+		)
+		# job_scores
+		c.execute(
+			"""
+			CREATE TABLE IF NOT EXISTS job_scores (
+				plane_id TEXT NOT NULL,
+				plane_type TEXT,
+				job_id TEXT NOT NULL,
+				feasible INTEGER NOT NULL,
+				reason TEXT,
+				pay_per_hour REAL,
+				xp_per_hour REAL,
+				balance_score REAL,
+				PRIMARY KEY(plane_id, job_id)
 			)
 			"""
 		)
@@ -131,18 +201,20 @@ def upsert_jobs(db_path: str, jobs: Iterable[Dict[str, Any]], *, source: str) ->
 			destination = _safe_get(job, "Destination") or _safe_get(job, "destination")
 			cargo_weight = _safe_get(job, "CargoWeight") or _safe_get(job, "cargo_weight") or _safe_get(job, "Cargo")
 			pay = _safe_get(job, "Pay") or _safe_get(job, "pay") or _safe_get(job, "Revenue")
+			xp = _safe_get(job, "XP") or _safe_get(job, "xp")
 			expires_at = _safe_get(job, "Expiration") or _safe_get(job, "expiration") or _safe_get(job, "ExpiresAt")
 
 			cursor.execute(
 				"""
-				INSERT INTO jobs (id, source, departure, destination, cargo_weight, pay, expires_at, computed_distance_nm, data_json, fetched_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT computed_distance_nm FROM jobs WHERE id=?), NULL), ?, ?)
+				INSERT INTO jobs (id, source, departure, destination, cargo_weight, pay, xp, expires_at, computed_distance_nm, data_json, fetched_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT computed_distance_nm FROM jobs WHERE id=?), NULL), ?, ?)
 				ON CONFLICT(id) DO UPDATE SET
 					source=excluded.source,
 					departure=excluded.departure,
 					destination=excluded.destination,
 					cargo_weight=excluded.cargo_weight,
 					pay=excluded.pay,
+					xp=excluded.xp,
 					expires_at=excluded.expires_at,
 					data_json=excluded.data_json,
 					fetched_at=excluded.fetched_at
@@ -154,6 +226,7 @@ def upsert_jobs(db_path: str, jobs: Iterable[Dict[str, Any]], *, source: str) ->
 					destination,
 					float(cargo_weight) if isinstance(cargo_weight, (int, float)) else None,
 					float(pay) if isinstance(pay, (int, float)) else None,
+					float(xp) if isinstance(xp, (int, float)) else None,
 					str(expires_at) if expires_at is not None else None,
 					job_id,
 					json.dumps(job, ensure_ascii=False),
@@ -161,7 +234,7 @@ def upsert_jobs(db_path: str, jobs: Iterable[Dict[str, Any]], *, source: str) ->
 				),
 			)
 			rows += 1
-		conn.commit()
+			conn.commit()
 	return rows
 
 
@@ -288,7 +361,7 @@ def upsert_airplanes(db_path: str, airplanes: Iterable[Dict[str, Any]]) -> int:
 				),
 			)
 			rows += 1
-		conn.commit()
+			conn.commit()
 	return rows
 
 
@@ -298,12 +371,12 @@ def clear_job_legs(db_path: str) -> None:
 		conn.commit()
 
 
-def upsert_job_leg(db_path: str, job_id: str, leg_index: int, from_icao: str, to_icao: str, from_lat: float, from_lon: float, to_lat: float, to_lon: float, distance_nm: float) -> None:
+def upsert_job_leg(db_path: str, job_id: str, leg_index: int, from_icao: str, to_icao: str, from_lat: float, from_lon: float, to_lat: float, to_lon: float, distance_nm: float, cargo_lbs: Optional[float] = None) -> None:
 	with connect(db_path) as conn:
 		conn.execute(
 			"""
-			INSERT INTO job_legs (job_id, leg_index, from_icao, to_icao, from_lat, from_lon, to_lat, to_lon, distance_nm)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO job_legs (job_id, leg_index, from_icao, to_icao, from_lat, from_lon, to_lat, to_lon, distance_nm, cargo_lbs)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(job_id, leg_index) DO UPDATE SET
 				from_icao=excluded.from_icao,
 				to_icao=excluded.to_icao,
@@ -311,9 +384,10 @@ def upsert_job_leg(db_path: str, job_id: str, leg_index: int, from_icao: str, to
 				from_lon=excluded.from_lon,
 				to_lat=excluded.to_lat,
 				to_lon=excluded.to_lon,
-				distance_nm=excluded.distance_nm
+				distance_nm=excluded.distance_nm,
+				cargo_lbs=excluded.cargo_lbs
 			""",
-			(job_id, leg_index, from_icao, to_icao, from_lat, from_lon, to_lat, to_lon, distance_nm),
+			(job_id, leg_index, from_icao, to_icao, from_lat, from_lon, to_lat, to_lon, distance_nm, cargo_lbs),
 		)
 		conn.commit()
 
@@ -321,4 +395,84 @@ def upsert_job_leg(db_path: str, job_id: str, leg_index: int, from_icao: str, to
 def update_job_total_distance(db_path: str, job_id: str, total_nm: float) -> None:
 	with connect(db_path) as conn:
 		conn.execute("UPDATE jobs SET computed_distance_nm = ? WHERE id = ?", (total_nm, job_id))
+		conn.commit()
+
+
+def upsert_plane_spec(db_path: str, *, plane_type: str, cruise_speed_kts: Optional[float], min_airport_size: Optional[int], range1_nm: Optional[float], payload1_lbs: Optional[float], range2_nm: Optional[float], payload2_lbs: Optional[float], priority: Optional[str], fuel_type: Optional[str]) -> None:
+	from datetime import datetime, timezone
+	updated_at = datetime.now(timezone.utc).isoformat()
+	with connect(db_path) as conn:
+		conn.execute(
+			"""
+			INSERT INTO plane_specs (plane_type, cruise_speed_kts, min_airport_size, range1_nm, payload1_lbs, range2_nm, payload2_lbs, priority, fuel_type, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(plane_type) DO UPDATE SET
+				cruise_speed_kts=excluded.cruise_speed_kts,
+				min_airport_size=excluded.min_airport_size,
+				range1_nm=excluded.range1_nm,
+				payload1_lbs=excluded.payload1_lbs,
+				range2_nm=excluded.range2_nm,
+				payload2_lbs=excluded.payload2_lbs,
+				priority=excluded.priority,
+				fuel_type=excluded.fuel_type,
+				updated_at=excluded.updated_at
+			""",
+			(
+				plane_type,
+				float(cruise_speed_kts) if cruise_speed_kts is not None else None,
+				int(min_airport_size) if min_airport_size is not None else None,
+				float(range1_nm) if range1_nm is not None else None,
+				float(payload1_lbs) if payload1_lbs is not None else None,
+				float(range2_nm) if range2_nm is not None else None,
+				float(payload2_lbs) if payload2_lbs is not None else None,
+				priority,
+				fuel_type,
+				updated_at,
+			),
+		)
+		conn.commit()
+
+
+def clear_job_scores(db_path: str) -> None:
+	with connect(db_path) as conn:
+		conn.execute("DELETE FROM job_scores")
+		conn.commit()
+
+
+def upsert_job_score(db_path: str, *, plane_id: str, plane_type: Optional[str], job_id: str, feasible: bool, reason: Optional[str], pay_per_hour: Optional[float], xp_per_hour: Optional[float], balance_score: Optional[float]) -> None:
+	with connect(db_path) as conn:
+		conn.execute(
+			"""
+			INSERT INTO job_scores (plane_id, plane_type, job_id, feasible, reason, pay_per_hour, xp_per_hour, balance_score)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(plane_id, job_id) DO UPDATE SET
+				plane_type=excluded.plane_type,
+				feasible=excluded.feasible,
+				reason=excluded.reason,
+				pay_per_hour=excluded.pay_per_hour,
+				xp_per_hour=excluded.xp_per_hour,
+				balance_score=excluded.balance_score
+			""",
+			(plane_id, plane_type, job_id, 1 if feasible else 0, reason, pay_per_hour, xp_per_hour, balance_score),
+		)
+		conn.commit()
+
+
+def upsert_job_scores_bulk(db_path: str, scores: Iterable[Tuple[str, Optional[str], str, int, Optional[str], Optional[float], Optional[float], Optional[float]]]) -> None:
+	"""Insert or update many job_scores rows in a single transaction."""
+	with connect(db_path) as conn:
+		conn.executemany(
+			"""
+			INSERT INTO job_scores (plane_id, plane_type, job_id, feasible, reason, pay_per_hour, xp_per_hour, balance_score)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(plane_id, job_id) DO UPDATE SET
+				plane_type=excluded.plane_type,
+				feasible=excluded.feasible,
+				reason=excluded.reason,
+				pay_per_hour=excluded.pay_per_hour,
+				xp_per_hour=excluded.xp_per_hour,
+				balance_score=excluded.balance_score
+			""",
+			list(scores),
+		)
 		conn.commit()
