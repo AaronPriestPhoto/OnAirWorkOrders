@@ -145,3 +145,20 @@ class OnAirClient:
 				continue
 			raise OnAirApiError(f"Unexpected response for {p}: {resp.status_code} {resp.text}")
 		raise OnAirApiError(f"Airport not found: {icao}")
+
+	def list_company_fleet(self) -> List[Dict[str, Any]]:
+		paths = [
+			f"/company/{self._config.company_id}/fleet",
+			f"/companies/{self._config.company_id}/fleet",
+		]
+		for p in paths:
+			resp = self._request("GET", p)
+			if resp.status_code == 200:
+				data = resp.json()
+				arr = _extract_list_payload(data) or (data if isinstance(data, list) else None)
+				if arr is not None:
+					return arr
+			elif resp.status_code == 404:
+				continue
+			raise OnAirApiError(f"Unexpected response for {p}: {resp.status_code} {resp.text}")
+		return []

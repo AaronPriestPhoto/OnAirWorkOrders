@@ -18,6 +18,8 @@ def _print_db_stats(db_path: str) -> None:
 		print("By source:")
 		for src, cnt in c.execute("select source, count(*) from jobs group by source order by count(*) desc"):
 			print(f"  {src}: {cnt}")
+		c.execute("select count(*) from airplanes")
+		print(f"Airplanes: {c.fetchone()[0]}")
 	finally:
 		conn.close()
 
@@ -31,7 +33,6 @@ def _maybe_add_icao(val: Any, seen: Set[str]) -> None:
 
 def _recurse_for_icaos(obj: Any, seen: Set[str]) -> None:
 	if isinstance(obj, dict):
-		# Prefer explicit ICAO fields on objects
 		for k in ("ICAO", "icao", "Icao"):
 			if k in obj and isinstance(obj[k], str):
 				_maybe_add_icao(obj[k], seen)
@@ -45,12 +46,10 @@ def _recurse_for_icaos(obj: Any, seen: Set[str]) -> None:
 def _collect_icaos_from_jobs(jobs: Iterable[Dict]) -> Set[str]:
 	seen: Set[str] = set()
 	for job in jobs:
-		# Common direct fields
 		for key in ("Departure", "Destination", "departure", "destination"):
 			val = job.get(key)
 			if isinstance(val, str):
 				_maybe_add_icao(val, seen)
-		# Cargos legs often include airports with ICAO fields
 		for cargo_key in ("Cargos", "cargos"):
 			cargos = job.get(cargo_key) or []
 			if isinstance(cargos, list):
@@ -61,7 +60,6 @@ def _collect_icaos_from_jobs(jobs: Iterable[Dict]) -> Set[str]:
 							icao = ap.get("ICAO") or ap.get("icao")
 							if isinstance(icao, str):
 								_maybe_add_icao(icao, seen)
-		# Generic recursive search as fallback
 		_recurse_for_icaos(job, seen)
 	return seen
 
@@ -96,10 +94,11 @@ def main(argv=None) -> int:
 	dbmod.init_db(cfg.db_path)
 	client = OnAirClient(cfg)
 
-	# Clear jobs table each online run for a fresh snapshot
+	# Clear jobs and airplanes tables each online run for a fresh snapshot
 	import sqlite3
 	with sqlite3.connect(cfg.db_path) as conn:
 		conn.execute("DELETE FROM jobs")
+		conn.execute("DELETE FROM airplanes")
 		conn.commit()
 
 	inserted = 0
@@ -122,8 +121,13 @@ def main(argv=None) -> int:
 
 	cached = _ensure_airports_cached(cfg, client, icaos)
 
+	# Fetch fleet
+	fleet = client.list_company_fleet()
+	planes = dbmod.upsert_airplanes(cfg.db_path, fleet)
+
 	print(f"Upserted {inserted} jobs into {cfg.db_path}")
 	print(f"Airports referenced: {len(icaos)}; cached (existing+fetched): {cached}")
+	print(f"Airplanes upserted: {planes}")
 	return 0
 
 

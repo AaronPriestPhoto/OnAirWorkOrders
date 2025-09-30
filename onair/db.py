@@ -33,6 +33,23 @@ CREATE TABLE IF NOT EXISTS airports (
 	updated_at TEXT NOT NULL,
 	data_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS airplanes (
+	id TEXT PRIMARY KEY,
+	registration TEXT,
+	type TEXT,
+	model TEXT,
+	icao TEXT,
+	status TEXT,
+	location_icao TEXT,
+	latitude REAL,
+	longitude REAL,
+	fuel_total REAL,
+	payload_capacity REAL,
+	seats INTEGER,
+	updated_at TEXT NOT NULL,
+	data_json TEXT NOT NULL
+);
 """
 
 
@@ -61,10 +78,6 @@ def _safe_get(obj: Dict[str, Any], *keys: str) -> Optional[Any]:
 
 
 def upsert_jobs(db_path: str, jobs: Iterable[Dict[str, Any]], *, source: str) -> int:
-	"""Insert or update jobs; stores raw JSON and some projected fields if present.
-
-	Returns number of rows upserted.
-	"""
 	rows = 0
 	fetched_at = datetime.now(timezone.utc).isoformat()
 	with connect(db_path) as conn:
@@ -175,3 +188,63 @@ def is_airport_stale(db_path: str, icao: str, max_age_days: int) -> bool:
 	except Exception:
 		return True
 	return updated < datetime.now(timezone.utc) - timedelta(days=max_age_days)
+
+
+def upsert_airplanes(db_path: str, airplanes: Iterable[Dict[str, Any]]) -> int:
+	rows = 0
+	updated_at = datetime.now(timezone.utc).isoformat()
+	with connect(db_path) as conn:
+		cur = conn.cursor()
+		for ap in airplanes:
+			ap_id = _safe_get(ap, "Id") or _safe_get(ap, "id")
+			reg = _safe_get(ap, "Registration") or _safe_get(ap, "TailNumber") or _safe_get(ap, "registration")
+			type_name = _safe_get(ap, "TypeName") or _safe_get(ap, "type")
+			model = _safe_get(ap, "Model") or _safe_get(ap, "model")
+			aircraft_icao = _safe_get(ap, "AircraftTypeICAO") or _safe_get(ap, "icao")
+			status = _safe_get(ap, "State") or _safe_get(ap, "Status") or _safe_get(ap, "state")
+			loc = _safe_get(ap, "CurrentAirportICAO") or _safe_get(ap, "LocationICAO") or _safe_get(ap, "location_icao")
+			lat = _safe_get(ap, "Latitude") or _safe_get(ap, "latitude")
+			lon = _safe_get(ap, "Longitude") or _safe_get(ap, "longitude")
+			fuel_total = _safe_get(ap, "FuelTotalQuantity") or _safe_get(ap, "fuel_total")
+			payload_cap = _safe_get(ap, "MaxPayload") or _safe_get(ap, "payload_capacity")
+			seats = _safe_get(ap, "Seats") or _safe_get(ap, "seats")
+
+			cur.execute(
+				"""
+				INSERT INTO airplanes (id, registration, type, model, icao, status, location_icao, latitude, longitude, fuel_total, payload_capacity, seats, updated_at, data_json)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT(id) DO UPDATE SET
+					registration=excluded.registration,
+					type=excluded.type,
+					model=excluded.model,
+					icao=excluded.icao,
+					status=excluded.status,
+					location_icao=excluded.location_icao,
+					latitude=excluded.latitude,
+					longitude=excluded.longitude,
+					fuel_total=excluded.fuel_total,
+					payload_capacity=excluded.payload_capacity,
+					seats=excluded.seats,
+					updated_at=excluded.updated_at,
+					data_json=excluded.data_json
+				""",
+				(
+					ap_id,
+					reg,
+					type_name,
+					model,
+					aircraft_icao,
+					status,
+					loc,
+					float(lat) if isinstance(lat, (int, float)) else None,
+					float(lon) if isinstance(lon, (int, float)) else None,
+					float(fuel_total) if isinstance(fuel_total, (int, float)) else None,
+					float(payload_cap) if isinstance(payload_cap, (int, float)) else None,
+					int(seats) if isinstance(seats, (int, float)) else None,
+					updated_at,
+					json.dumps(ap, ensure_ascii=False),
+				),
+			)
+			rows += 1
+		conn.commit()
+	return rows
