@@ -4,7 +4,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, List, Tuple
 
 
 _SCHEMA = """
@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 	cargo_weight REAL,
 	pay REAL,
 	expires_at TEXT,
+	computed_distance_nm REAL,
 	data_json TEXT NOT NULL,
 	fetched_at TEXT NOT NULL
 );
@@ -50,6 +51,19 @@ CREATE TABLE IF NOT EXISTS airplanes (
 	updated_at TEXT NOT NULL,
 	data_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS job_legs (
+	job_id TEXT NOT NULL,
+	leg_index INTEGER NOT NULL,
+	from_icao TEXT NOT NULL,
+	to_icao TEXT NOT NULL,
+	from_lat REAL,
+	from_lon REAL,
+	to_lat REAL,
+	to_lon REAL,
+	distance_nm REAL,
+	PRIMARY KEY(job_id, leg_index)
+);
 """
 
 
@@ -65,6 +79,33 @@ def connect(db_path: str):
 def init_db(db_path: str) -> None:
 	with connect(db_path) as conn:
 		conn.executescript(_SCHEMA)
+		conn.commit()
+
+
+def migrate_schema(db_path: str) -> None:
+	with connect(db_path) as conn:
+		c = conn.cursor()
+		# jobs.computed_distance_nm
+		cols = [r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()]
+		if "computed_distance_nm" not in cols:
+			c.execute("ALTER TABLE jobs ADD COLUMN computed_distance_nm REAL")
+		# job_legs table
+		c.execute(
+			"""
+			CREATE TABLE IF NOT EXISTS job_legs (
+				job_id TEXT NOT NULL,
+				leg_index INTEGER NOT NULL,
+				from_icao TEXT NOT NULL,
+				to_icao TEXT NOT NULL,
+				from_lat REAL,
+				from_lon REAL,
+				to_lat REAL,
+				to_lon REAL,
+				distance_nm REAL,
+				PRIMARY KEY(job_id, leg_index)
+			)
+			"""
+		)
 		conn.commit()
 
 
@@ -94,8 +135,8 @@ def upsert_jobs(db_path: str, jobs: Iterable[Dict[str, Any]], *, source: str) ->
 
 			cursor.execute(
 				"""
-				INSERT INTO jobs (id, source, departure, destination, cargo_weight, pay, expires_at, data_json, fetched_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				INSERT INTO jobs (id, source, departure, destination, cargo_weight, pay, expires_at, computed_distance_nm, data_json, fetched_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT computed_distance_nm FROM jobs WHERE id=?), NULL), ?, ?)
 				ON CONFLICT(id) DO UPDATE SET
 					source=excluded.source,
 					departure=excluded.departure,
@@ -114,6 +155,7 @@ def upsert_jobs(db_path: str, jobs: Iterable[Dict[str, Any]], *, source: str) ->
 					float(cargo_weight) if isinstance(cargo_weight, (int, float)) else None,
 					float(pay) if isinstance(pay, (int, float)) else None,
 					str(expires_at) if expires_at is not None else None,
+					job_id,
 					json.dumps(job, ensure_ascii=False),
 					fetched_at,
 				),
@@ -248,3 +290,35 @@ def upsert_airplanes(db_path: str, airplanes: Iterable[Dict[str, Any]]) -> int:
 			rows += 1
 		conn.commit()
 	return rows
+
+
+def clear_job_legs(db_path: str) -> None:
+	with connect(db_path) as conn:
+		conn.execute("DELETE FROM job_legs")
+		conn.commit()
+
+
+def upsert_job_leg(db_path: str, job_id: str, leg_index: int, from_icao: str, to_icao: str, from_lat: float, from_lon: float, to_lat: float, to_lon: float, distance_nm: float) -> None:
+	with connect(db_path) as conn:
+		conn.execute(
+			"""
+			INSERT INTO job_legs (job_id, leg_index, from_icao, to_icao, from_lat, from_lon, to_lat, to_lon, distance_nm)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(job_id, leg_index) DO UPDATE SET
+				from_icao=excluded.from_icao,
+				to_icao=excluded.to_icao,
+				from_lat=excluded.from_lat,
+				from_lon=excluded.from_lon,
+				to_lat=excluded.to_lat,
+				to_lon=excluded.to_lon,
+				distance_nm=excluded.distance_nm
+			""",
+			(job_id, leg_index, from_icao, to_icao, from_lat, from_lon, to_lat, to_lon, distance_nm),
+		)
+		conn.commit()
+
+
+def update_job_total_distance(db_path: str, job_id: str, total_nm: float) -> None:
+	with connect(db_path) as conn:
+		conn.execute("UPDATE jobs SET computed_distance_nm = ? WHERE id = ?", (total_nm, job_id))
+		conn.commit()
