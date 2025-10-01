@@ -98,13 +98,13 @@ def _fetch_scores_for_plane(conn: sqlite3.Connection, plane_id: str) -> List[Dic
 	]
 
 
-def _route_for_job(conn: sqlite3.Connection, job_id: str) -> Tuple[str, int, float, int | None]:
+def _route_for_job(conn: sqlite3.Connection, job_id: str) -> Tuple[str, int, float, int | None, str, str]:
 	legs = conn.execute(
 		"SELECT leg_index, from_icao, to_icao, IFNULL(distance_nm,0) FROM job_legs WHERE job_id = ? ORDER BY leg_index",
 		(job_id,),
 	).fetchall()
 	if not legs:
-		return ("", 0, 0.0, None)
+		return ("", 0, 0.0, None, "", "")
 	points: List[str] = []
 	total_nm = 0.0
 	min_ap_size: int | None = None
@@ -126,7 +126,9 @@ def _route_for_job(conn: sqlite3.Connection, job_id: str) -> Tuple[str, int, flo
 	for code in points:
 		if not route_seq or route_seq[-1] != code:
 			route_seq.append(code)
-	return (", ".join([c for c in route_seq if c]), len(legs), total_nm, min_ap_size)
+	departure = route_seq[0] if route_seq else ""
+	destination = route_seq[-1] if route_seq else ""
+	return (", ".join([c for c in route_seq if c]), len(legs), total_nm, min_ap_size, departure, destination)
 
 
 def main() -> int:
@@ -152,7 +154,7 @@ def main() -> int:
 		csv_writer = csv.writer(csv_file)
 		csv_writer.writerow([
 			"plane_id", "plane_type", "registration", "job_id", "source", "distance_nm",
-			"pay_per_hour", "xp_per_hour", "balance_score", "pay", "xp", "FlightHrs", "Speed", "MinAp", "route", "legs_count",
+			"pay_per_hour", "xp_per_hour", "balance_score", "pay", "xp", "FlightHrs", "Speed", "MinAp", "Departure", "Destination", "route", "legs_count",
 		])
 
 	for plane in planes:
@@ -183,11 +185,11 @@ def main() -> int:
 		print(f"Plane {plane['registration'] or plane['id']} [{ptype}] priority={priority}")
 		speed_kts = _get_plane_speed_kts(conn, plane["id"], ptype)
 		for i, s in enumerate(best, 1):
-			route, legs_cnt, total_nm, min_ap = _route_for_job(conn, s["job_id"]) 
+			route, legs_cnt, total_nm, min_ap, departure, destination = _route_for_job(conn, s["job_id"]) 
 			flight_hrs = (total_nm / speed_kts) if speed_kts and speed_kts > 0 else 0.0
 			min_ap_str = "" if min_ap is None else str(min_ap)
 			print(
-				f"  {i}. job={s['job_id']} source={s['source']} dist={s['distance_nm']:.0f}nm pay/hr={s['pay_per_hour']:.0f} xp/hr={s['xp_per_hour']:.0f} bal={s['balance_score']:.3f} hrs={flight_hrs:.2f} speed={speed_kts:.0f}kts minAp={min_ap_str} route={route}"
+				f"  {i}. job={s['job_id']} source={s['source']} dist={s['distance_nm']:.0f}nm pay/hr={s['pay_per_hour']:.0f} xp/hr={s['xp_per_hour']:.0f} bal={s['balance_score']:.3f} hrs={flight_hrs:.2f} speed={speed_kts:.0f}kts minAp={min_ap_str} {departure}->{destination} route={route}"
 			)
 			if csv_writer:
 				# Skip writing to CSV if --unique-jobs is set and we've already seen this job
@@ -197,7 +199,7 @@ def main() -> int:
 					csv_seen_jobs.add(s["job_id"])
 				csv_writer.writerow([
 					plane["id"], ptype, plane.get("registration"), s["job_id"], s["source"], f"{s['distance_nm']:.2f}",
-					f"{s['pay_per_hour']:.2f}", f"{s['xp_per_hour']:.2f}", f"{s['balance_score']:.6f}", f"{s['pay']:.2f}", f"{s['xp']:.2f}", f"{flight_hrs:.2f}", f"{speed_kts:.0f}", min_ap_str, route, legs_cnt,
+					f"{s['pay_per_hour']:.2f}", f"{s['xp_per_hour']:.2f}", f"{s['balance_score']:.6f}", f"{s['pay']:.2f}", f"{s['xp']:.2f}", f"{flight_hrs:.2f}", f"{speed_kts:.0f}", min_ap_str, departure, destination, route, legs_cnt,
 				])
 		print("")
 

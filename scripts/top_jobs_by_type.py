@@ -55,13 +55,13 @@ def _speed_for_type_or_plane(conn: sqlite3.Connection, plane_type: str | None, p
 	return 0.0
 
 
-def _route_for_job(conn: sqlite3.Connection, job_id: str) -> Tuple[str, int, float, int | None]:
+def _route_for_job(conn: sqlite3.Connection, job_id: str) -> Tuple[str, int, float, int | None, str, str]:
 	legs = conn.execute(
 		"SELECT leg_index, from_icao, to_icao, IFNULL(distance_nm,0) FROM job_legs WHERE job_id = ? ORDER BY leg_index",
 		(job_id,),
 	).fetchall()
 	if not legs:
-		return ("", 0, 0.0, None)
+		return ("", 0, 0.0, None, "", "")
 	points: List[str] = []
 	total_nm = 0.0
 	min_ap_size: int | None = None
@@ -83,7 +83,9 @@ def _route_for_job(conn: sqlite3.Connection, job_id: str) -> Tuple[str, int, flo
 	for code in points:
 		if not route_seq or route_seq[-1] != code:
 			route_seq.append(code)
-	return (", ".join([c for c in route_seq if c]), len(legs), total_nm, min_ap_size)
+	departure = route_seq[0] if route_seq else ""
+	destination = route_seq[-1] if route_seq else ""
+	return (", ".join([c for c in route_seq if c]), len(legs), total_nm, min_ap_size, departure, destination)
 
 
 def _plane_type_label(js_plane_type: str | None, airplane_data_json: str | None) -> str:
@@ -142,7 +144,7 @@ def main() -> int:
 		writer.writerow([
 			"plane_type", "job_id", "source", "distance_nm",
 			"pay_per_hour", "xp_per_hour", "balance_score", "pay", "xp",
-			"FlightHrs", "Speed", "MinAp", "route", "legs_count",
+			"FlightHrs", "Speed", "MinAp", "Departure", "Destination", "route", "legs_count",
 		])
 
 		for ptype, scores in sorted(by_type.items(), key=lambda kv: kv[0]):
@@ -167,13 +169,13 @@ def main() -> int:
 					break
 
 			for s in top:
-				route, legs_cnt, total_nm, min_ap = _route_for_job(conn, s["job_id"]) 
+				route, legs_cnt, total_nm, min_ap, departure, destination = _route_for_job(conn, s["job_id"]) 
 				speed_kts = _speed_for_type_or_plane(conn, ptype, s["plane_id"]) or 0.0
 				flight_hrs = (total_nm / speed_kts) if speed_kts and speed_kts > 0 else 0.0
 				writer.writerow([
 					ptype, s["job_id"], s["source"], f"{s['distance_nm']:.2f}",
 					f"{s['pay_per_hour']:.2f}", f"{s['xp_per_hour']:.2f}", f"{s['balance_score']:.6f}", f"{s['pay']:.2f}", f"{s['xp']:.2f}",
-					f"{flight_hrs:.2f}", f"{speed_kts:.0f}", ("" if min_ap is None else min_ap), route, legs_cnt,
+					f"{flight_hrs:.2f}", f"{speed_kts:.0f}", ("" if min_ap is None else min_ap), departure, destination, route, legs_cnt,
 				])
 
 	print(f"CSV written: {args.csv}")
