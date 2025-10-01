@@ -137,14 +137,10 @@ def main():
 	parser = argparse.ArgumentParser(description="Fetch jobs from OnAir API and store in SQLite.")
 	parser.add_argument("--mode", type=str, choices=["online", "offline"],
 					help="Run mode: 'online' to fetch from API, 'offline' to use cached data.")
-	parser.add_argument("--cargo-only", action="store_true", default=True,
-					help="Filter out passenger/PAX jobs, keep only cargo jobs. (Default: enabled)")
 	parser.add_argument("--no-cargo-only", action="store_true", 
-					help="Disable cargo-only filtering, include passenger/PAX jobs.")
-	parser.add_argument("--nohuman-only", action="store_true", default=True,
-					help="Filter out human-only jobs, keep only automated jobs. (Default: enabled)")
+					help="Include passenger/PAX jobs (default: cargo-only)")
 	parser.add_argument("--no-nohuman-only", action="store_true", 
-					help="Disable human-only filtering, include human-only jobs.")
+					help="Include human-only jobs (default: automated only)")
 	args = parser.parse_args()
 
 	config = cfg_mod.load_config()
@@ -203,11 +199,11 @@ def main():
 		filtered_jobs = fbo_jobs
 		
 		# Apply cargo-only filtering (default: enabled)
-		if args.cargo_only and not args.no_cargo_only:
+		if not args.no_cargo_only:
 			filtered_jobs = [job for job in filtered_jobs if _is_cargo_only_job(job)]
 		
 		# Apply human-only filtering (default: enabled)
-		if args.nohuman_only and not args.no_nohuman_only:
+		if not args.no_nohuman_only:
 			filtered_jobs = [job for job in filtered_jobs if _is_automated_job(job)]
 		
 		fbo_jobs = filtered_jobs
@@ -215,9 +211,9 @@ def main():
 		
 		if filtered_count > 0:
 			filter_types = []
-			if args.cargo_only and not args.no_cargo_only:
+			if not args.no_cargo_only:
 				filter_types.append("passenger")
-			if args.nohuman_only and not args.no_nohuman_only:
+			if not args.no_nohuman_only:
 				filter_types.append("human-only")
 			filter_desc = " and ".join(filter_types)
 			tqdm.write(f"  {icao}: filtered out {filtered_count} {filter_desc} jobs")
