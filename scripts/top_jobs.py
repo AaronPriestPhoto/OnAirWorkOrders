@@ -134,6 +134,7 @@ def main() -> int:
 	parser.add_argument("--plane-type", default=None, help="Filter to planes matching this type/model (DisplayName/TypeName supported)")
 	parser.add_argument("--limit", type=int, default=5, help="Number of jobs to show per plane")
 	parser.add_argument("--csv", default=None, help="Path to write CSV of results")
+	parser.add_argument("--unique-jobs", action="store_true", help="For CSV output, deduplicate jobs across all planes (show each job only once)")
 	cfg = load_config()
 	conn = sqlite3.connect(cfg.db_path)
 	_ensure_plane_specs_columns(conn)
@@ -145,6 +146,7 @@ def main() -> int:
 
 	csv_writer = None
 	csv_file = None
+	csv_seen_jobs = set()  # Track unique jobs for CSV when --unique-jobs is used
 	if args.csv:
 		csv_file = open(args.csv, "w", newline="", encoding="utf-8")
 		csv_writer = csv.writer(csv_file)
@@ -188,6 +190,11 @@ def main() -> int:
 				f"  {i}. job={s['job_id']} source={s['source']} dist={s['distance_nm']:.0f}nm pay/hr={s['pay_per_hour']:.0f} xp/hr={s['xp_per_hour']:.0f} bal={s['balance_score']:.3f} hrs={flight_hrs:.2f} speed={speed_kts:.0f}kts minAp={min_ap_str} route={route}"
 			)
 			if csv_writer:
+				# Skip writing to CSV if --unique-jobs is set and we've already seen this job
+				if args.unique_jobs and s["job_id"] in csv_seen_jobs:
+					continue
+				if args.unique_jobs:
+					csv_seen_jobs.add(s["job_id"])
 				csv_writer.writerow([
 					plane["id"], ptype, plane.get("registration"), s["job_id"], s["source"], f"{s['distance_nm']:.2f}",
 					f"{s['pay_per_hour']:.2f}", f"{s['xp_per_hour']:.2f}", f"{s['balance_score']:.6f}", f"{s['pay']:.2f}", f"{s['xp']:.2f}", f"{flight_hrs:.2f}", f"{speed_kts:.0f}", min_ap_str, route, legs_cnt,
