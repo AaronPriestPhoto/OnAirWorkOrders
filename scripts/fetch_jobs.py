@@ -168,6 +168,12 @@ def main():
 			missing = _verify_airports_for_jobs(conn)
 			if missing:
 				print(f"WARNING: {len(missing)} ICAOs referenced in jobs are missing in airports (offline): {', '.join(sorted(missing))}")
+		
+		# Score jobs automatically
+		print("Scoring jobs...")
+		from scripts.score_jobs import main as score_jobs_main
+		score_jobs_main()
+		
 		return 0
 
 	print("Running in ONLINE mode. Fetching fresh data from API.")
@@ -314,6 +320,11 @@ def main():
 	print(f"Airports referenced: {len(unique_icaos)}; cached (existing+fetched): {cached_airports_count + fetched_airports_count}")
 	with db_mod.connect(config.db_path) as conn:
 		print(f"Job legs stored: {conn.execute('SELECT COUNT(*) FROM job_legs').fetchone()[0]}")
+
+	# Score jobs automatically
+	print("Scoring jobs...")
+	from scripts.score_jobs import main as score_jobs_main
+	score_jobs_main()
 
 	return 0
 
