@@ -2,7 +2,12 @@ import argparse
 import csv
 import sqlite3
 import json
+import sys
+import os
 from typing import Dict, List, Tuple
+
+# Add the project root to the Python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from onair.config import load_config
 
