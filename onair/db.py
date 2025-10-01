@@ -200,7 +200,7 @@ def upsert_jobs(db_path: str, jobs: Iterable[Dict[str, Any]], *, source: str) ->
 			departure = _safe_get(job, "Departure") or _safe_get(job, "departure")
 			destination = _safe_get(job, "Destination") or _safe_get(job, "destination")
 			cargo_weight = _safe_get(job, "CargoWeight") or _safe_get(job, "cargo_weight") or _safe_get(job, "Cargo")
-			pay = _safe_get(job, "Pay") or _safe_get(job, "pay") or _safe_get(job, "Revenue")
+			pay = _safe_get(job, "RealPay") or _safe_get(job, "Pay") or _safe_get(job, "pay") or _safe_get(job, "Revenue")
 			xp = _safe_get(job, "XP") or _safe_get(job, "xp")
 			expires_at = _safe_get(job, "Expiration") or _safe_get(job, "expiration") or _safe_get(job, "ExpiresAt")
 
