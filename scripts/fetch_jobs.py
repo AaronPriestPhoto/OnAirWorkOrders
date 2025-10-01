@@ -173,11 +173,15 @@ def main():
 	print("Running in ONLINE mode. Fetching fresh data from API.")
 	
 	# Clear tables for fresh data in online mode
+	print("Clearing existing data...")
 	with db_mod.connect(config.db_path) as conn:
 		conn.execute('DELETE FROM jobs')
 		conn.execute('DELETE FROM job_legs')
 		conn.execute('DELETE FROM airplanes')
+		conn.execute('DELETE FROM plane_specs')
+		conn.execute('DELETE FROM job_scores')
 		conn.commit()
+	print("Database cleared for fresh data.")
 
 	all_jobs = []
 
