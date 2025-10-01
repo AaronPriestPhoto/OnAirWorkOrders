@@ -3,6 +3,9 @@ import sys
 import os
 import pandas as pd
 
+# Add the project root to the Python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from onair.config import load_config
 from onair import db as dbmod
 
@@ -10,7 +13,7 @@ from onair import db as dbmod
 COLUMN_MAP = {
 	"Plane": "plane_type",
 	"Speed": "cruise_speed_kts",
-	"MinAirport": "min_airport_size",
+	"Airport": "min_airport_size",
 	"Range1": "range1_nm",
 	"Payload1": "payload1_lbs",
 	"Range2": "range2_nm",
@@ -20,20 +23,22 @@ COLUMN_MAP = {
 }
 
 
-def main(argv=None) -> int:
+def load_plane_specs_from_file(file_path: str = None, sheet_name: str = "Planes") -> int:
+	"""Load plane specs from Excel file without argument parsing."""
 	cfg = load_config()
 	dbmod.init_db(cfg.db_path)
 	dbmod.migrate_schema(cfg.db_path)
-	parser = argparse.ArgumentParser(description="Load plane specs from planes.xlsx Planes sheet")
-	parser.add_argument("--file", default="planes.xlsx", help="Path to planes.xlsx")
-	parser.add_argument("--sheet", default="Planes", help="Sheet name containing specs")
-	args = parser.parse_args(argv)
+	
+	# Get project root directory if no file path provided
+	if file_path is None:
+		project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+		file_path = os.path.join(project_root, "planes.xlsx")
 
-	if not os.path.exists(args.file):
-		print(f"File not found: {args.file}")
+	if not os.path.exists(file_path):
+		print(f"File not found: {file_path}")
 		return 1
 
-	df = pd.read_excel(args.file, sheet_name=args.sheet)
+	df = pd.read_excel(file_path, sheet_name=sheet_name)
 	df = df.rename(columns=COLUMN_MAP)
 	for _, row in df.iterrows():
 		plane_type = str(row.get("plane_type")).strip() if pd.notna(row.get("plane_type")) else None
@@ -53,6 +58,18 @@ def main(argv=None) -> int:
 		)
 	print("Plane specs loaded.")
 	return 0
+
+
+def main(argv=None) -> int:
+	# Get project root directory
+	project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+	
+	parser = argparse.ArgumentParser(description="Load plane specs from planes.xlsx Planes sheet")
+	parser.add_argument("--file", default=os.path.join(project_root, "planes.xlsx"), help="Path to planes.xlsx")
+	parser.add_argument("--sheet", default="Planes", help="Sheet name containing specs")
+	args = parser.parse_args(argv)
+
+	return load_plane_specs_from_file(args.file, args.sheet)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import sys
 import os
 import json
 from collections import defaultdict
+from tqdm import tqdm
 
 # Add the project root to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -169,20 +170,35 @@ def main():
 			if sp:
 				plane_specs_cache[p] = sp
 
-	# Compute in memory
+	# Compute in memory with progress bar
 	bulk = []
+	total_combinations = len(planes) * len(jobs)
+	scored_count = 0
+	
+	# Create a progress bar for the scoring process
+	progress = tqdm(total=total_combinations, desc="Scoring jobs", unit="combinations")
+	
 	for pl in planes:
 		ptype = pl.get("type")
 		api_data = json.loads(pl["data_json"]) if pl.get("data_json") else {}
 		spec = plane_specs_cache.get(ptype) or _get_plane_specs(None, None, None, api_data)  # fallback from API data
 		if not spec:
+			# Still need to update progress for skipped planes
+			progress.update(len(jobs))
 			continue
+			
 		for job_id, job in jobs.items():
 			legs = legs_by_job.get(job_id, [])
 			if not legs:
+				progress.update(1)
 				continue
 			feas, reason, pph, xph, bal = _score_job_for_plane(airports, spec, job_id, job, legs)
 			bulk.append((pl["id"], ptype, job_id, int(feas), reason, pph, xph, bal))
+			scored_count += 1
+			progress.update(1)
+			progress.set_postfix({"Plane": (ptype or "Unknown")[:20], "Scored": scored_count})
+	
+	progress.close()
 
 	# Write in bulk
 	db_mod.clear_job_scores(db_path)

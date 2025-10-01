@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 from datetime import datetime, timedelta
+from tqdm import tqdm
 
 # Add the project root to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -107,8 +108,6 @@ def main():
 	parser = argparse.ArgumentParser(description="Fetch jobs from OnAir API and store in SQLite.")
 	parser.add_argument("--mode", type=str, choices=["online", "offline"],
 					help="Run mode: 'online' to fetch from API, 'offline' to use cached data.")
-	parser.add_argument("--scope", type=str, choices=["all", "company", "fbos"], default="all",
-					help="Scope of jobs to fetch: 'all' (company + FBOs), 'company', or 'fbos'.")
 	args = parser.parse_args()
 
 	config = cfg_mod.load_config()
@@ -121,7 +120,14 @@ def main():
 	if run_mode == 'offline':
 		print("Running in OFFLINE mode. Using cached data only.")
 		_print_offline_stats(config.db_path)
+		
+		# Load plane specs (always needed for scoring)
+		print("Loading plane specs...")
+		from scripts.load_plane_specs import load_plane_specs_from_file
+		load_plane_specs_from_file()
+		
 		# Try to build legs from existing data too
+		print("Building job legs...")
 		built = _build_job_legs_and_distances(config.db_path)
 		print(f"Rebuilt job legs from cache: {built}")
 		# Verify all ICAOs for legs have airport rows
@@ -141,32 +147,39 @@ def main():
 		conn.commit()
 
 	all_jobs = []
-	
-	# Fetch company jobs
-	if args.scope in ["all", "company"]:
-		print("Fetching company jobs...")
-		company_jobs = client.list_company_jobs()
-		all_jobs.extend(company_jobs)
-		inserted = db_mod.upsert_jobs(config.db_path, company_jobs, source="company")
-		print(f"Upserted {inserted} company jobs.")
 
 	# Fetch FBO jobs
-	if args.scope in ["all", "fbos"]:
-		print("Fetching FBOs...")
-		fbos = client.list_fbos()
-		print(f"Found {len(fbos)} FBOs. Fetching jobs for each...")
-		for fbo in fbos:
-			fbo_id = fbo['Id']
-			fbo_jobs = client.list_fbo_jobs(fbo_id)
-			all_jobs.extend(fbo_jobs)
-			inserted = db_mod.upsert_jobs(config.db_path, fbo_jobs, source=f"fbo:{fbo_id}")
-			print(f"Upserted {inserted} jobs for FBO {fbo['Airport']['ICAO']}.")
+	print("Fetching FBOs...")
+	fbos = client.list_fbos()
+	print(f"Found {len(fbos)} FBOs. Fetching jobs for each...")
+	
+	# Add progress bar for FBO job fetching
+	fbo_progress = tqdm(fbos, desc="Fetching FBO jobs", unit="FBO", position=1, leave=False)
+	total_fbo_jobs = 0
+	for fbo in fbo_progress:
+		fbo_id = fbo['Id']
+		icao = fbo['Airport']['ICAO']
+		fbo_jobs = client.list_fbo_jobs(fbo_id)
+		all_jobs.extend(fbo_jobs)
+		inserted = db_mod.upsert_jobs(config.db_path, fbo_jobs, source=f"fbo:{fbo_id}")
+		total_fbo_jobs += inserted
+		fbo_progress.set_postfix({"ICAO": icao, "Jobs": inserted, "Total": total_fbo_jobs})
+		# Print detailed info above the progress bar
+		tqdm.write(f"  {icao}: {inserted} jobs")
+	
+	fbo_progress.close()
+	print(f"Total FBO jobs upserted: {total_fbo_jobs}")
 
 	# Fetch airplanes
 	print("Fetching company fleet...")
 	airplanes = client.list_company_fleet()
 	inserted_airplanes = db_mod.upsert_airplanes(config.db_path, airplanes)
 	print(f"Airplanes upserted: {inserted_airplanes}")
+
+	# Load plane specs
+	print("Loading plane specs...")
+	from scripts.load_plane_specs import load_plane_specs_from_file
+	load_plane_specs_from_file()
 
 	# Extract all unique ICAOs from fetched jobs (including nested legs)
 	unique_icaos = set()
@@ -191,26 +204,48 @@ def main():
 	print(f"Found {len(unique_icaos)} unique ICAOs in jobs. Checking cache...")
 
 	# Fetch and cache airport data
+	print(f"Processing {len(unique_icaos)} unique ICAOs for airport data...")
 	with db_mod.connect(config.db_path) as conn:
 		cursor = conn.cursor()
 		cached_airports_count = 0
 		fetched_airports_count = 0
 
-		for icao in unique_icaos:
+		# Add progress bar for airport fetching
+		airport_progress = tqdm(unique_icaos, desc="Processing airports", unit="ICAO", position=0)
+		for icao in airport_progress:
 			airport_data = db_mod.get_airport(config.db_path, icao)
 			is_stale = db_mod.is_airport_stale(config.db_path, icao, config.airport_cache_days) if airport_data else True
 			if airport_data and not is_stale:
 				cached_airports_count += 1
+				airport_progress.set_postfix({"ICAO": icao, "Status": "cached", "Fetched": fetched_airports_count, "Cached": cached_airports_count})
+				# Print detailed info above the progress bar
+				from datetime import datetime, timezone, timedelta
+				if airport_data and airport_data.get("updated_at"):
+					try:
+						updated = datetime.fromisoformat(airport_data["updated_at"]).replace(tzinfo=timezone.utc)
+						age_days = (datetime.now(timezone.utc) - updated).days
+						tqdm.write(f"  {icao}: using cached data (age: {age_days} days)")
+					except Exception:
+						tqdm.write(f"  {icao}: using cached data")
+				else:
+					tqdm.write(f"  {icao}: using cached data")
 			else:
 				try:
-					print(f"Fetching airport data for {icao}...")
 					api_airport_data = client.get_airport_by_icao(icao)
 					db_mod.upsert_airport(config.db_path, api_airport_data)
 					fetched_airports_count += 1
+					airport_progress.set_postfix({"ICAO": icao, "Status": "fetched", "Fetched": fetched_airports_count, "Cached": cached_airports_count})
+					# Print detailed info above the progress bar
+					if airport_data and is_stale:
+						tqdm.write(f"  {icao}: fetched new data (cache expired >{config.airport_cache_days} days)")
+					else:
+						tqdm.write(f"  {icao}: fetched new data (not previously cached)")
 				except api_mod.OnAirApiError as e:
-					print(f"Warning: Could not fetch airport data for {icao}: {e}")
+					airport_progress.set_postfix({"ICAO": icao, "Status": "error", "Fetched": fetched_airports_count, "Cached": cached_airports_count})
+					tqdm.write(f"Warning: Could not fetch airport data for {icao}: {e}")
 
 		# Build legs and distances now that airports are cached
+		print("Building job legs...")
 		built = _build_job_legs_and_distances(config.db_path)
 		print(f"Job legs built: {built}")
 
