@@ -96,29 +96,45 @@ def _get_plane_specs(conn, plane_type_display_name, plane_type_name, api_plane_d
 
 
 def _calculate_payload_range_limit(plane_spec, distance_nm):
+	# Get the maximum range and maximum payload for bounds checking
+	max_range = max(plane_spec["range1_nm"] or 0, plane_spec["range2_nm"] or 0)
+	max_payload = max(plane_spec["payload1_lbs"] or 0, plane_spec["payload2_lbs"] or 0)
+	
+	# If distance exceeds maximum range, no payload possible
+	if distance_nm > max_range:
+		return 0
+	
+	# If we have identical ranges, return max payload if within range
 	if plane_spec["range1_nm"] == plane_spec["range2_nm"]:
-		if distance_nm <= plane_spec["range1_nm"]:
-			return max(plane_spec["payload1_lbs"], plane_spec["payload2_lbs"])
-		else:
-			return 0
+		return max_payload
+	
+	# If we have identical payloads, return that payload if within range
 	if plane_spec["payload1_lbs"] == plane_spec["payload2_lbs"]:
-		if distance_nm <= max(plane_spec["range1_nm"], plane_spec["range2_nm"]):
-			return plane_spec["payload1_lbs"]
-		else:
-			return 0
+		return plane_spec["payload1_lbs"]
+	
+	# Sort the range/payload pairs to ensure r1 <= r2
 	if plane_spec["range1_nm"] > plane_spec["range2_nm"]:
 		r1, p1 = plane_spec["range2_nm"], plane_spec["payload2_lbs"]
 		r2, p2 = plane_spec["range1_nm"], plane_spec["payload1_lbs"]
 	else:
 		r1, p1 = plane_spec["range1_nm"], plane_spec["payload1_lbs"]
 		r2, p2 = plane_spec["range2_nm"], plane_spec["payload2_lbs"]
+	
+	# Handle edge cases
+	if r1 == r2:  # Same range, different payloads
+		return max_payload if distance_nm <= r1 else 0
+	
+	# Linear interpolation between the two points
 	if distance_nm <= r1:
-		return max(p1, p2)
+		return max(p1, p2)  # Use maximum payload for short distances
 	elif distance_nm >= r2:
-		return min(p1, p2)
+		return min(p1, p2)  # Use minimum payload for long distances
 	else:
+		# Linear interpolation: payload decreases as distance increases
 		m = (p2 - p1) / (r2 - r1)
-		return p1 + m * (distance_nm - r1)
+		calculated_payload = p1 + m * (distance_nm - r1)
+		# Ensure we never exceed the maximum payload
+		return min(calculated_payload, max_payload)
 
 
 def _score_job_for_plane(airports, plane_spec, job_id, job, legs):
@@ -126,7 +142,8 @@ def _score_job_for_plane(airports, plane_spec, job_id, job, legs):
 	reason = "OK"
 	speed = plane_spec["speed_kts"] or 0
 	min_sz = int(plane_spec.get("min_airport_size") or 0)
-	max_range = plane_spec["range2_nm"] or 0
+	# Use the maximum of both ranges to determine if job is feasible
+	max_range = max(plane_spec["range1_nm"] or 0, plane_spec["range2_nm"] or 0)
 	if (job["computed_distance_nm"] or 0) > max_range:
 		return (0, "Job distance exceeds max range", 0.0, 0.0, 0.0)
 	flight_hours = 0.0
