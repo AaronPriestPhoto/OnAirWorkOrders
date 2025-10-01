@@ -213,30 +213,23 @@ def main():
 		fbo_jobs = filtered_jobs
 		filtered_count = original_count - len(fbo_jobs)
 		
-		if filtered_count > 0:
-			filter_types = []
-			if not args.enable_passenger_jobs:
-				filter_types.append("passenger")
-			if not args.enable_human_only_jobs:
-				filter_types.append("human-only")
-			filter_desc = " and ".join(filter_types)
-			tqdm.write(f"  {icao}: filtered out {filtered_count} {filter_desc} jobs")
+		# Note: Filtering happens silently - no per-FBO messages needed
 		
 		all_jobs.extend(fbo_jobs)
 		inserted = db_mod.upsert_jobs(config.db_path, fbo_jobs, source=f"fbo:{fbo_id}")
 		total_fbo_jobs += inserted
-		fbo_progress.set_postfix({"ICAO": icao, "Jobs": inserted, "Total": total_fbo_jobs})
+		fbo_progress.set_postfix({"ICAO": icao, "Jobs": inserted, "Sum": total_fbo_jobs})
 		# Print detailed info above the progress bar
 		tqdm.write(f"  {icao}: {inserted} jobs")
 	
 	fbo_progress.close()
-	print(f"Total FBO jobs upserted: {total_fbo_jobs}")
+	print(f"Total FBO jobs downloaded: {total_fbo_jobs}")
 
 	# Fetch airplanes
 	print("Fetching company fleet...")
 	airplanes = client.list_company_fleet()
 	inserted_airplanes = db_mod.upsert_airplanes(config.db_path, airplanes)
-	print(f"Airplanes upserted: {inserted_airplanes}")
+	print(f"Airplanes downloaded: {inserted_airplanes}")
 
 	# Load plane specs
 	print("Loading plane specs...")
