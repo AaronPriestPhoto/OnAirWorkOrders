@@ -104,10 +104,47 @@ def _build_job_legs_and_distances(db_path: str) -> int:
 	return inserted
 
 
+def _is_cargo_only_job(job: dict) -> bool:
+	"""Check if a job is cargo-only (no passenger/PAX requirements)."""
+	# Check for passenger jobs
+	total_pax = job.get("TotalPaxTransported", 0)
+	charters = job.get("Charters", [])
+	
+	if total_pax > 0 or len(charters) > 0:
+		return False
+	
+	# If we get here, it's cargo-only
+	return True
+
+
+def _is_automated_job(job: dict) -> bool:
+	"""Check if a job is automated (no human-only requirements)."""
+	# Check for human-only jobs (check both job level and cargo level)
+	if job.get("HumanOnly", False):
+		return False
+	
+	# Check for human-only cargo items
+	cargos = job.get("Cargos", [])
+	for cargo in cargos:
+		if cargo.get("HumanOnly", False):
+			return False
+	
+	# If we get here, it's automated
+	return True
+
+
 def main():
 	parser = argparse.ArgumentParser(description="Fetch jobs from OnAir API and store in SQLite.")
 	parser.add_argument("--mode", type=str, choices=["online", "offline"],
 					help="Run mode: 'online' to fetch from API, 'offline' to use cached data.")
+	parser.add_argument("--cargo-only", action="store_true", default=True,
+					help="Filter out passenger/PAX jobs, keep only cargo jobs. (Default: enabled)")
+	parser.add_argument("--no-cargo-only", action="store_true", 
+					help="Disable cargo-only filtering, include passenger/PAX jobs.")
+	parser.add_argument("--nohuman-only", action="store_true", default=True,
+					help="Filter out human-only jobs, keep only automated jobs. (Default: enabled)")
+	parser.add_argument("--no-nohuman-only", action="store_true", 
+					help="Disable human-only filtering, include human-only jobs.")
 	args = parser.parse_args()
 
 	config = cfg_mod.load_config()
@@ -160,6 +197,31 @@ def main():
 		fbo_id = fbo['Id']
 		icao = fbo['Airport']['ICAO']
 		fbo_jobs = client.list_fbo_jobs(fbo_id)
+		
+		# Apply filtering (both enabled by default, can be disabled)
+		original_count = len(fbo_jobs)
+		filtered_jobs = fbo_jobs
+		
+		# Apply cargo-only filtering (default: enabled)
+		if args.cargo_only and not args.no_cargo_only:
+			filtered_jobs = [job for job in filtered_jobs if _is_cargo_only_job(job)]
+		
+		# Apply human-only filtering (default: enabled)
+		if args.nohuman_only and not args.no_nohuman_only:
+			filtered_jobs = [job for job in filtered_jobs if _is_automated_job(job)]
+		
+		fbo_jobs = filtered_jobs
+		filtered_count = original_count - len(fbo_jobs)
+		
+		if filtered_count > 0:
+			filter_types = []
+			if args.cargo_only and not args.no_cargo_only:
+				filter_types.append("passenger")
+			if args.nohuman_only and not args.no_nohuman_only:
+				filter_types.append("human-only")
+			filter_desc = " and ".join(filter_types)
+			tqdm.write(f"  {icao}: filtered out {filtered_count} {filter_desc} jobs")
+		
 		all_jobs.extend(fbo_jobs)
 		inserted = db_mod.upsert_jobs(config.db_path, fbo_jobs, source=f"fbo:{fbo_id}")
 		total_fbo_jobs += inserted
