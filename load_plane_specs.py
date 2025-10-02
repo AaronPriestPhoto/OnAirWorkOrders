@@ -3,8 +3,7 @@ import sys
 import os
 import pandas as pd
 
-# Add the project root to the Python path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Scripts are now in the root directory - no path modification needed
 
 from onair.config import load_config
 from onair import db as dbmod

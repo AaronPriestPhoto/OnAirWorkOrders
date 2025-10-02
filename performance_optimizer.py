@@ -6,8 +6,7 @@ from math import radians, cos, sin, asin, sqrt
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 
-# Add the project root to the Python path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Scripts are now in the root directory - no path modification needed
 
 from onair.config import load_config
 from onair import db as dbmod
@@ -284,15 +283,14 @@ class PerformanceOptimizer:
 					return float(row[0])
 		except Exception:
 			pass
-		return 500  # Conservative fallback if no data available
+		return 0.0  # Return 0 if no data available to make missing data obvious
 	
 	def get_optimized_speed(self, plane_type: str, distance_nm: float, payload_lbs: float, 
 						   dep_size: int, dest_size: int) -> float:
 		"""Get optimized speed calculation for a specific job, factoring in fuel weight."""
 		if plane_type not in self.performance_curves:
 			# Fall back to default max cruise speed from plane specs
-			default_max = self._get_default_max_speed(plane_type)
-			return min(default_max, 500)  # Conservative clamping for fallback
+			return self._get_default_max_speed(plane_type)
 		
 		curve = self.performance_curves[plane_type]
 		
@@ -364,7 +362,7 @@ def main():
 	optimizer = PerformanceOptimizer(config.db_path)
 	
 	# Load and process sample jobs
-	excel_path = os.path.join(os.path.dirname(__file__), '..', 'planes.xlsx')
+	excel_path = os.path.join(os.path.dirname(__file__), 'planes.xlsx')
 	optimizer.load_and_process(excel_path)
 	
 	# Test optimized speed calculation

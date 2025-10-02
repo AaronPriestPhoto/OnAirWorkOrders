@@ -7,8 +7,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from tqdm import tqdm
 
-# Add the project root to the Python path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Scripts are now in the root directory - no path modification needed
 
 from onair import config as cfg_mod
 from onair import api as api_mod
@@ -157,7 +156,7 @@ def main():
 		
 		# Load plane specs (always needed for scoring)
 		print("Loading plane specs...")
-		from scripts.load_plane_specs import load_plane_specs_from_file
+		from load_plane_specs import load_plane_specs_from_file
 		load_plane_specs_from_file()
 		
 		# Try to build legs from existing data too
@@ -172,7 +171,7 @@ def main():
 		
 		# Score jobs automatically
 		print("Scoring jobs...")
-		from scripts.score_jobs import main as score_jobs_main
+		from score_jobs import main as score_jobs_main
 		score_jobs_main()
 		
 		return 0
@@ -240,7 +239,7 @@ def main():
 
 	# Load plane specs
 	print("Loading plane specs...")
-	from scripts.load_plane_specs import load_plane_specs_from_file
+	from load_plane_specs import load_plane_specs_from_file
 	load_plane_specs_from_file()
 
 	# Extract all unique ICAOs from fetched jobs (including nested legs)
@@ -330,7 +329,7 @@ def main():
 
 	# Score jobs automatically
 	print("Scoring jobs...")
-	from scripts.score_jobs import main as score_jobs_main
+	from score_jobs import main as score_jobs_main
 	score_jobs_main()
 
 	return 0

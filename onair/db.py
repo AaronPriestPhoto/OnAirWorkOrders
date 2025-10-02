@@ -312,9 +312,20 @@ def upsert_airplanes(db_path: str, airplanes: Iterable[Dict[str, Any]]) -> int:
 		cur = conn.cursor()
 		for ap in airplanes:
 			ap_id = _safe_get(ap, "Id") or _safe_get(ap, "id")
-			reg = _safe_get(ap, "Registration") or _safe_get(ap, "TailNumber") or _safe_get(ap, "registration")
-			type_name = _safe_get(ap, "TypeName") or _safe_get(ap, "type")
-			model = _safe_get(ap, "Model") or _safe_get(ap, "model")
+			reg = _safe_get(ap, "Registration") or _safe_get(ap, "TailNumber") or _safe_get(ap, "Ident") or _safe_get(ap, "Identifier") or _safe_get(ap, "registration")
+			# Extract type from nested AircraftType object or direct fields
+			aircraft_type_obj = ap.get("AircraftType", {})
+			type_name = (
+				_safe_get(aircraft_type_obj, "DisplayName") or 
+				_safe_get(aircraft_type_obj, "TypeName") or
+				_safe_get(ap, "TypeName") or 
+				_safe_get(ap, "type")
+			)
+			model = (
+				_safe_get(aircraft_type_obj, "TypeName") or
+				_safe_get(ap, "Model") or 
+				_safe_get(ap, "model")
+			)
 			aircraft_icao = _safe_get(ap, "AircraftTypeICAO") or _safe_get(ap, "icao")
 			status = _safe_get(ap, "State") or _safe_get(ap, "Status") or _safe_get(ap, "state")
 			loc = _safe_get(ap, "CurrentAirportICAO") or _safe_get(ap, "LocationICAO") or _safe_get(ap, "location_icao")
