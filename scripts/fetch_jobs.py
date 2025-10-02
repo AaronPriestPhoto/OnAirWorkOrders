@@ -3,6 +3,7 @@ import os
 import argparse
 import json
 import math
+import pandas as pd
 from datetime import datetime, timedelta
 from tqdm import tqdm
 
@@ -262,7 +263,13 @@ def main():
 				if (ch.get('DestinationAirport') or {}).get('ICAO'):
 					unique_icaos.add(ch['DestinationAirport']['ICAO'])
 
-	print(f"Found {len(unique_icaos)} unique ICAOs in jobs. Checking cache...")
+	print(f"Found {len(unique_icaos)} unique ICAOs in FBO jobs.")
+	
+	# Add airports from sample jobs for performance optimization
+	sample_airports = _get_airports_from_sample_jobs()
+	if sample_airports:
+		unique_icaos.update(sample_airports)
+		print(f"Total unique ICAOs (FBO + sample jobs): {len(unique_icaos)}")
 
 	# Fetch and cache airport data
 	print(f"Processing {len(unique_icaos)} unique ICAOs for airport data...")
@@ -327,6 +334,38 @@ def main():
 	score_jobs_main()
 
 	return 0
+
+
+def _get_airports_from_sample_jobs() -> set:
+	"""Extract all unique airports from sample jobs in planes.xlsx."""
+	project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+	excel_path = os.path.join(project_root, "planes.xlsx")
+	
+	if not os.path.exists(excel_path):
+		return set()
+	
+	try:
+		# Read sample jobs
+		df = pd.read_excel(excel_path, sheet_name='Jobs')
+		
+		# Get all unique airports from departure and destination columns
+		airports_in_jobs = set()
+		for _, row in df.iterrows():
+			dep = str(row.get('Departure', '')).strip().upper()
+			dest = str(row.get('Destination', '')).strip().upper()
+			if dep and dep != 'NAN':
+				airports_in_jobs.add(dep)
+			if dest and dest != 'NAN':
+				airports_in_jobs.add(dest)
+		
+		print(f"  Sample jobs: extracted {len(airports_in_jobs)} unique airports for performance optimization")
+		return airports_in_jobs
+	except ImportError:
+		print("  Sample jobs: pandas not available, skipping sample job airport extraction")
+		return set()
+	except Exception as e:
+		print(f"  Sample jobs: Could not read from {excel_path}: {e}")
+		return set()
 
 
 def _verify_airports_for_jobs(conn):

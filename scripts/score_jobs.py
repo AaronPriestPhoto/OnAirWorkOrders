@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from onair import config as cfg_mod
 from onair import db as db_mod
+from performance_optimizer import PerformanceOptimizer
 
 
 def _load_airports(conn):
@@ -137,10 +138,10 @@ def _calculate_payload_range_limit(plane_spec, distance_nm):
 		return min(calculated_payload, max_payload)
 
 
-def _score_job_for_plane(airports, plane_spec, job_id, job, legs):
+def _score_job_for_plane(airports, plane_spec, job_id, job, legs, optimizer=None, plane_type=None):
 	feasible = 1
 	reason = "OK"
-	speed = plane_spec["speed_kts"] or 0
+	base_speed = plane_spec["speed_kts"] or 0
 	min_sz = int(plane_spec.get("min_airport_size") or 0)
 	# Use the maximum of both ranges to determine if job is feasible
 	max_range = max(plane_spec["range1_nm"] or 0, plane_spec["range2_nm"] or 0)
@@ -161,6 +162,20 @@ def _score_job_for_plane(airports, plane_spec, job_id, job, legs):
 		cap = _calculate_payload_range_limit(plane_spec, leg["distance_nm"] or 0)
 		if (leg["cargo_lbs"] or 0) > cap:
 			return (0, f"Leg cargo exceeds capacity for {leg['distance_nm']:.0f}nm", 0.0, 0.0, 0.0)
+		
+		# Use optimized speed if available, otherwise fall back to base speed
+		if optimizer and plane_type:
+			optimized_speed = optimizer.get_optimized_speed(
+				plane_type, 
+				leg["distance_nm"] or 0, 
+				leg["cargo_lbs"] or 0, 
+				fsz, 
+				tsz
+			)
+			speed = optimized_speed if optimized_speed else base_speed
+		else:
+			speed = base_speed
+		
 		if speed <= 0:
 			return (0, "Plane speed is 0", 0.0, 0.0, 0.0)
 		flight_hours += (leg["distance_nm"] or 0) / speed
@@ -175,6 +190,17 @@ def _score_job_for_plane(airports, plane_spec, job_id, job, legs):
 def main():
 	config = cfg_mod.load_config()
 	db_path = config.db_path
+	
+	# Initialize performance optimizer
+	optimizer = PerformanceOptimizer(db_path)
+	excel_path = os.path.join(os.path.dirname(__file__), '..', 'planes.xlsx')
+	if os.path.exists(excel_path):
+		print("Loading performance optimization data...")
+		optimizer.load_and_process(excel_path)
+		print(f"Loaded optimization data for {len(optimizer.performance_curves)} plane types")
+	else:
+		print("No performance optimization data found, using default calculations")
+	
 	with db_mod.connect(db_path) as conn:
 		airports = _load_airports(conn)
 		jobs, legs_by_job = _load_jobs_and_legs(conn)
@@ -209,7 +235,7 @@ def main():
 			if not legs:
 				progress.update(1)
 				continue
-			feas, reason, pph, xph, bal = _score_job_for_plane(airports, spec, job_id, job, legs)
+			feas, reason, pph, xph, bal = _score_job_for_plane(airports, spec, job_id, job, legs, optimizer, ptype)
 			bulk.append((pl["id"], ptype, job_id, int(feas), reason, pph, xph, bal))
 			scored_count += 1
 			progress.update(1)

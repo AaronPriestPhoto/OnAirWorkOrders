@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from onair.config import load_config
+from performance_optimizer import PerformanceOptimizer
 
 
 def _ensure_plane_specs_columns(conn: sqlite3.Connection) -> None:
@@ -141,6 +142,14 @@ def main() -> int:
 	conn = sqlite3.connect(cfg.db_path)
 	_ensure_plane_specs_columns(conn)
 	args = parser.parse_args()
+	
+	# Initialize performance optimizer
+	optimizer = PerformanceOptimizer(cfg.db_path)
+	excel_path = os.path.join(os.path.dirname(__file__), '..', 'planes.xlsx')
+	if os.path.exists(excel_path):
+		optimizer.load_and_process(excel_path)
+	else:
+		optimizer = None
 	planes = _get_planes(conn, args.plane_type)
 	if not planes:
 		print("No planes found.")
@@ -183,10 +192,45 @@ def main() -> int:
 				break
 
 		print(f"Plane {plane['registration'] or plane['id']} [{ptype}] priority={priority}")
-		speed_kts = _get_plane_speed_kts(conn, plane["id"], ptype)
+		base_speed_kts = _get_plane_speed_kts(conn, plane["id"], ptype)
 		for i, s in enumerate(best, 1):
 			route, legs_cnt, total_nm, min_ap, departure, destination = _route_for_job(conn, s["job_id"]) 
-			flight_hrs = (total_nm / speed_kts) if speed_kts and speed_kts > 0 else 0.0
+			
+			# Calculate optimized flight hours per leg if optimizer is available
+			if optimizer and ptype:
+				# Get detailed leg information for per-leg optimization
+				legs = conn.execute("""
+					SELECT distance_nm, cargo_lbs, from_icao, to_icao 
+					FROM job_legs 
+					WHERE job_id = ? 
+					ORDER BY leg_index
+				""", (s["job_id"],)).fetchall()
+				
+				total_flight_hrs = 0.0
+				total_optimized_distance = 0.0
+				
+				for leg in legs:
+					leg_distance = leg[0] or 0
+					leg_payload = leg[1] or 0
+					
+					# Get airport sizes for this leg (use min_ap as fallback)
+					dep_size = min_ap or 0
+					dest_size = min_ap or 0
+					
+					# Calculate optimized speed for this specific leg
+					leg_speed = optimizer.get_optimized_speed(ptype, leg_distance, leg_payload, dep_size, dest_size)
+					if leg_speed and leg_speed > 0:
+						leg_flight_hrs = leg_distance / leg_speed
+						total_flight_hrs += leg_flight_hrs
+						total_optimized_distance += leg_distance
+				
+				# Calculate average speed for display
+				flight_hrs = total_flight_hrs
+				speed_kts = total_optimized_distance / total_flight_hrs if total_flight_hrs > 0 else base_speed_kts
+			else:
+				# Fallback to base speed calculation
+				speed_kts = base_speed_kts
+				flight_hrs = (total_nm / speed_kts) if speed_kts and speed_kts > 0 else 0.0
 			min_ap_str = "" if min_ap is None else str(min_ap)
 			print(
 				f"  {i}. job={s['job_id']} source={s['source']} dist={s['distance_nm']:.0f}nm pay/hr={s['pay_per_hour']:.0f} xp/hr={s['xp_per_hour']:.0f} bal={s['balance_score']:.3f} hrs={flight_hrs:.2f} speed={speed_kts:.0f}kts minAp={min_ap_str} {departure}->{destination} route={route}"
