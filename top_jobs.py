@@ -47,6 +47,50 @@ def _calculate_time_remaining_hours(job_id: str, conn: sqlite3.Connection) -> fl
 		return 0.0
 
 
+def _calculate_adjusted_pay_metrics(job_id: str, flight_hours: float, conn: sqlite3.Connection, 
+									penalty_hours_to_max: float = 24.0) -> tuple[float, float, float]:
+	"""Calculate adjusted pay metrics considering scaled penalties for late jobs.
+	
+	Args:
+		job_id: The job ID to calculate penalties for
+		flight_hours: Expected flight time in hours
+		conn: Database connection
+		penalty_hours_to_max: Hours after deadline to reach 100% penalty (default: 24 hours)
+	
+	Returns:
+		tuple: (adjusted_pay_per_hour, penalty_amount, adjusted_pay_total)
+	"""
+	row = conn.execute("SELECT data_json FROM jobs WHERE id = ?", (job_id,)).fetchone()
+	if not row or not row[0]:
+		return 0.0, 0.0, 0.0
+	
+	try:
+		job_data = json.loads(row[0])
+		
+		# Get base pay and maximum penalty amounts
+		real_pay = job_data.get("RealPay", 0.0)
+		max_penalty = job_data.get("RealPenality", 0.0) or job_data.get("Penality", 0.0)
+		
+		# Calculate time remaining and lateness
+		time_remaining_hrs = _calculate_time_remaining_hours(job_id, conn)
+		hours_late = max(0.0, flight_hours - time_remaining_hrs)
+		
+		# Calculate scaled penalty based on how late the job will be
+		penalty_amount = 0.0
+		if hours_late > 0:
+			# Linear penalty scaling: 0% at deadline, 100% at penalty_hours_to_max hours late
+			penalty_percentage = min(1.0, hours_late / penalty_hours_to_max)
+			penalty_amount = max_penalty * penalty_percentage
+		
+		# Calculate adjusted pay
+		adjusted_pay_total = real_pay - penalty_amount
+		adjusted_pay_per_hour = adjusted_pay_total / flight_hours if flight_hours > 0 else 0.0
+		
+		return adjusted_pay_per_hour, penalty_amount, adjusted_pay_total
+	except Exception:
+		return 0.0, 0.0, 0.0
+
+
 def _get_planes(conn: sqlite3.Connection, plane_type_filter: str | None) -> List[Dict]:
 	rows = conn.execute("SELECT id, registration, type, model, data_json FROM airplanes").fetchall()
 	planes: List[Dict] = []
@@ -227,7 +271,7 @@ def _handle_by_type_mode(conn: sqlite3.Connection, args, optimizer) -> int:
 		csv_writer.writerow([
 			"plane_type", "job_id", "source", "distance_nm",
 			"pay_per_hour", "xp_per_hour", "balance_score", "pay", "xp",
-			"FlightHrs", "TimeRemainingHrs", "Speed", "MinAp", "Departure", "Destination", "route", "legs_count",
+			"FlightHrs", "TimeRemainingHrs", "adjusted_pay_per_hour", "penalty_amount", "adjusted_pay_total", "Speed", "MinAp", "Departure", "Destination", "route", "legs_count",
 		])
 
 	for ptype, scores in sorted(by_type.items(), key=lambda kv: kv[0]):
@@ -293,9 +337,18 @@ def _handle_by_type_mode(conn: sqlite3.Connection, args, optimizer) -> int:
 			flight_hrs = total_flight_hrs
 			speed_kts = total_optimized_distance / total_flight_hrs if total_flight_hrs > 0 else base_speed_kts
 			
+			# Calculate adjusted pay for console display
+			time_remaining_hrs = _calculate_time_remaining_hours(s["job_id"], conn)
+			hours_late = max(0.0, flight_hrs - time_remaining_hrs)
+			adjusted_pay_per_hour, penalty_amount, adjusted_pay_total = _calculate_adjusted_pay_metrics(s["job_id"], flight_hrs, conn, args.penalty_hours)
+			
 			min_ap_str = "" if min_ap is None else str(min_ap)
+			late_indicator = f" [LATE {hours_late:.1f}h]" if hours_late > 0 else ""
+			penalty_str = f" penalty={penalty_amount:.0f}" if penalty_amount > 0 else ""
+			adjusted_pay_str = f" adj_pay/hr={adjusted_pay_per_hour:.0f}" if penalty_amount > 0 else ""
+			
 			print(
-				f"  {i}. job={s['job_id']} source={s['source']} dist={s['distance_nm']:.0f}nm pay/hr={s['pay_per_hour']:.0f} xp/hr={s['xp_per_hour']:.0f} bal={s['balance_score']:.3f} hrs={flight_hrs:.2f} speed={speed_kts:.0f}kts minAp={min_ap_str} {departure}->{destination} route={route}"
+				f"  {i}. job={s['job_id']} source={s['source']} dist={s['distance_nm']:.0f}nm pay/hr={s['pay_per_hour']:.0f}{adjusted_pay_str} xp/hr={s['xp_per_hour']:.0f} bal={s['balance_score']:.3f} hrs={flight_hrs:.2f} speed={speed_kts:.0f}kts minAp={min_ap_str} {departure}->{destination} route={route}{late_indicator}{penalty_str}"
 			)
 			
 			if csv_writer:
@@ -305,13 +358,14 @@ def _handle_by_type_mode(conn: sqlite3.Connection, args, optimizer) -> int:
 				if args.unique_jobs:
 					csv_seen_jobs.add(s["job_id"])
 				
-				# Calculate time remaining for this job
+				# Calculate time remaining and adjusted pay for this job
 				time_remaining_hrs = _calculate_time_remaining_hours(s["job_id"], conn)
+				adjusted_pay_per_hour, penalty_amount, adjusted_pay_total = _calculate_adjusted_pay_metrics(s["job_id"], flight_hrs, conn, args.penalty_hours)
 				
 				csv_writer.writerow([
 					ptype, s["job_id"], s["source"], f"{s['distance_nm']:.2f}",
 					f"{s['pay_per_hour']:.2f}", f"{s['xp_per_hour']:.2f}", f"{s['balance_score']:.6f}", f"{s['pay']:.2f}", f"{s['xp']:.2f}",
-					f"{flight_hrs:.2f}", f"{time_remaining_hrs:.2f}", f"{speed_kts:.0f}", min_ap_str, departure, destination, route, legs_cnt,
+					f"{flight_hrs:.2f}", f"{time_remaining_hrs:.2f}", f"{adjusted_pay_per_hour:.2f}", f"{penalty_amount:.2f}", f"{adjusted_pay_total:.2f}", f"{speed_kts:.0f}", min_ap_str, departure, destination, route, legs_cnt,
 				])
 		print("")
 
@@ -329,6 +383,7 @@ def main() -> int:
 	parser.add_argument("--csv", default=None, help="Path to write CSV of results")
 	parser.add_argument("--unique-jobs", action="store_true", help="For CSV output, deduplicate jobs across all planes (show each job only once)")
 	parser.add_argument("--by-type", action="store_true", help="Group results by plane type instead of individual planes")
+	parser.add_argument("--penalty-hours", type=float, default=24.0, help="Hours after deadline to reach 100%% penalty (default: 24.0)")
 	cfg = load_config()
 	conn = sqlite3.connect(cfg.db_path)
 	_ensure_plane_specs_columns(conn)
@@ -359,7 +414,7 @@ def main() -> int:
 		csv_writer = csv.writer(csv_file)
 		csv_writer.writerow([
 			"plane_id", "plane_type", "registration", "job_id", "source", "distance_nm",
-			"pay_per_hour", "xp_per_hour", "balance_score", "pay", "xp", "FlightHrs", "TimeRemainingHrs", "Speed", "MinAp", "Departure", "Destination", "route", "legs_count",
+			"pay_per_hour", "xp_per_hour", "balance_score", "pay", "xp", "FlightHrs", "TimeRemainingHrs", "adjusted_pay_per_hour", "penalty_amount", "adjusted_pay_total", "Speed", "MinAp", "Departure", "Destination", "route", "legs_count",
 		])
 
 	for plane in planes:
@@ -427,9 +482,19 @@ def main() -> int:
 				# Fallback to base speed calculation
 				speed_kts = base_speed_kts
 				flight_hrs = (total_nm / speed_kts) if speed_kts and speed_kts > 0 else 0.0
+			
+			# Calculate adjusted pay for console display
+			time_remaining_hrs = _calculate_time_remaining_hours(s["job_id"], conn)
+			hours_late = max(0.0, flight_hrs - time_remaining_hrs)
+			adjusted_pay_per_hour, penalty_amount, adjusted_pay_total = _calculate_adjusted_pay_metrics(s["job_id"], flight_hrs, conn, args.penalty_hours)
+			
 			min_ap_str = "" if min_ap is None else str(min_ap)
+			late_indicator = f" [LATE {hours_late:.1f}h]" if hours_late > 0 else ""
+			penalty_str = f" penalty={penalty_amount:.0f}" if penalty_amount > 0 else ""
+			adjusted_pay_str = f" adj_pay/hr={adjusted_pay_per_hour:.0f}" if penalty_amount > 0 else ""
+			
 			print(
-				f"  {i}. job={s['job_id']} source={s['source']} dist={s['distance_nm']:.0f}nm pay/hr={s['pay_per_hour']:.0f} xp/hr={s['xp_per_hour']:.0f} bal={s['balance_score']:.3f} hrs={flight_hrs:.2f} speed={speed_kts:.0f}kts minAp={min_ap_str} {departure}->{destination} route={route}"
+				f"  {i}. job={s['job_id']} source={s['source']} dist={s['distance_nm']:.0f}nm pay/hr={s['pay_per_hour']:.0f}{adjusted_pay_str} xp/hr={s['xp_per_hour']:.0f} bal={s['balance_score']:.3f} hrs={flight_hrs:.2f} speed={speed_kts:.0f}kts minAp={min_ap_str} {departure}->{destination} route={route}{late_indicator}{penalty_str}"
 			)
 			if csv_writer:
 				# Skip writing to CSV if --unique-jobs is set and we've already seen this job
@@ -438,12 +503,13 @@ def main() -> int:
 				if args.unique_jobs:
 					csv_seen_jobs.add(s["job_id"])
 				
-				# Calculate time remaining for this job
+				# Calculate time remaining and adjusted pay for this job
 				time_remaining_hrs = _calculate_time_remaining_hours(s["job_id"], conn)
+				adjusted_pay_per_hour, penalty_amount, adjusted_pay_total = _calculate_adjusted_pay_metrics(s["job_id"], flight_hrs, conn, args.penalty_hours)
 				
 				csv_writer.writerow([
 					plane["id"], ptype, plane.get("registration"), s["job_id"], s["source"], f"{s['distance_nm']:.2f}",
-					f"{s['pay_per_hour']:.2f}", f"{s['xp_per_hour']:.2f}", f"{s['balance_score']:.6f}", f"{s['pay']:.2f}", f"{s['xp']:.2f}", f"{flight_hrs:.2f}", f"{time_remaining_hrs:.2f}", f"{speed_kts:.0f}", min_ap_str, departure, destination, route, legs_cnt,
+					f"{s['pay_per_hour']:.2f}", f"{s['xp_per_hour']:.2f}", f"{s['balance_score']:.6f}", f"{s['pay']:.2f}", f"{s['xp']:.2f}", f"{flight_hrs:.2f}", f"{time_remaining_hrs:.2f}", f"{adjusted_pay_per_hour:.2f}", f"{penalty_amount:.2f}", f"{adjusted_pay_total:.2f}", f"{speed_kts:.0f}", min_ap_str, departure, destination, route, legs_cnt,
 				])
 		print("")
 
