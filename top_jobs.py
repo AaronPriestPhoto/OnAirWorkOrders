@@ -4,6 +4,7 @@ import sqlite3
 import json
 import sys
 import os
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
 # Scripts are now in the root directory - no path modification needed
@@ -17,6 +18,33 @@ def _ensure_plane_specs_columns(conn: sqlite3.Connection) -> None:
 	if "speed_kts" not in cols:
 		conn.execute("ALTER TABLE plane_specs ADD COLUMN speed_kts REAL")
 		conn.commit()
+
+
+def _calculate_time_remaining_hours(job_id: str, conn: sqlite3.Connection) -> float:
+	"""Calculate time remaining until job expiration in hours."""
+	row = conn.execute("SELECT data_json FROM jobs WHERE id = ?", (job_id,)).fetchone()
+	if not row or not row[0]:
+		return 0.0
+	
+	try:
+		job_data = json.loads(row[0])
+		expiration_str = job_data.get("ExpirationDate")
+		if not expiration_str:
+			return 0.0
+		
+		# Parse the expiration date (format: 2025-10-03T15:43:41.117)
+		expiration_dt = datetime.fromisoformat(expiration_str.replace('Z', '+00:00'))
+		if expiration_dt.tzinfo is None:
+			expiration_dt = expiration_dt.replace(tzinfo=timezone.utc)
+		
+		# Calculate time remaining
+		now = datetime.now(timezone.utc)
+		time_remaining = expiration_dt - now
+		
+		# Convert to hours (can be negative if expired)
+		return time_remaining.total_seconds() / 3600.0
+	except Exception:
+		return 0.0
 
 
 def _get_planes(conn: sqlite3.Connection, plane_type_filter: str | None) -> List[Dict]:
@@ -199,7 +227,7 @@ def _handle_by_type_mode(conn: sqlite3.Connection, args, optimizer) -> int:
 		csv_writer.writerow([
 			"plane_type", "job_id", "source", "distance_nm",
 			"pay_per_hour", "xp_per_hour", "balance_score", "pay", "xp",
-			"FlightHrs", "Speed", "MinAp", "Departure", "Destination", "route", "legs_count",
+			"FlightHrs", "TimeRemainingHrs", "Speed", "MinAp", "Departure", "Destination", "route", "legs_count",
 		])
 
 	for ptype, scores in sorted(by_type.items(), key=lambda kv: kv[0]):
@@ -276,10 +304,14 @@ def _handle_by_type_mode(conn: sqlite3.Connection, args, optimizer) -> int:
 					continue
 				if args.unique_jobs:
 					csv_seen_jobs.add(s["job_id"])
+				
+				# Calculate time remaining for this job
+				time_remaining_hrs = _calculate_time_remaining_hours(s["job_id"], conn)
+				
 				csv_writer.writerow([
 					ptype, s["job_id"], s["source"], f"{s['distance_nm']:.2f}",
 					f"{s['pay_per_hour']:.2f}", f"{s['xp_per_hour']:.2f}", f"{s['balance_score']:.6f}", f"{s['pay']:.2f}", f"{s['xp']:.2f}",
-					f"{flight_hrs:.2f}", f"{speed_kts:.0f}", min_ap_str, departure, destination, route, legs_cnt,
+					f"{flight_hrs:.2f}", f"{time_remaining_hrs:.2f}", f"{speed_kts:.0f}", min_ap_str, departure, destination, route, legs_cnt,
 				])
 		print("")
 
@@ -327,7 +359,7 @@ def main() -> int:
 		csv_writer = csv.writer(csv_file)
 		csv_writer.writerow([
 			"plane_id", "plane_type", "registration", "job_id", "source", "distance_nm",
-			"pay_per_hour", "xp_per_hour", "balance_score", "pay", "xp", "FlightHrs", "Speed", "MinAp", "Departure", "Destination", "route", "legs_count",
+			"pay_per_hour", "xp_per_hour", "balance_score", "pay", "xp", "FlightHrs", "TimeRemainingHrs", "Speed", "MinAp", "Departure", "Destination", "route", "legs_count",
 		])
 
 	for plane in planes:
@@ -405,9 +437,13 @@ def main() -> int:
 					continue
 				if args.unique_jobs:
 					csv_seen_jobs.add(s["job_id"])
+				
+				# Calculate time remaining for this job
+				time_remaining_hrs = _calculate_time_remaining_hours(s["job_id"], conn)
+				
 				csv_writer.writerow([
 					plane["id"], ptype, plane.get("registration"), s["job_id"], s["source"], f"{s['distance_nm']:.2f}",
-					f"{s['pay_per_hour']:.2f}", f"{s['xp_per_hour']:.2f}", f"{s['balance_score']:.6f}", f"{s['pay']:.2f}", f"{s['xp']:.2f}", f"{flight_hrs:.2f}", f"{speed_kts:.0f}", min_ap_str, departure, destination, route, legs_cnt,
+					f"{s['pay_per_hour']:.2f}", f"{s['xp_per_hour']:.2f}", f"{s['balance_score']:.6f}", f"{s['pay']:.2f}", f"{s['xp']:.2f}", f"{flight_hrs:.2f}", f"{time_remaining_hrs:.2f}", f"{speed_kts:.0f}", min_ap_str, departure, destination, route, legs_cnt,
 				])
 		print("")
 
