@@ -79,9 +79,9 @@ def fetch_and_cache_airports(missing_airports: set) -> int:
 
 def main():
     """Main function to fetch missing airports from sample jobs."""
-    # Get project root directory
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    excel_path = os.path.join(project_root, "planes.xlsx")
+    # Get current directory (where planes.xlsx is located)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    excel_path = os.path.join(current_dir, "planes.xlsx")
     
     if not os.path.exists(excel_path):
         print(f"Error: {excel_path} not found")

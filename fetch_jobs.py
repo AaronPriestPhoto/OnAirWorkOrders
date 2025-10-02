@@ -237,8 +237,8 @@ def main():
 	inserted_airplanes = db_mod.upsert_airplanes(config.db_path, airplanes)
 	print(f"Airplanes downloaded: {inserted_airplanes}")
 
-	# Load plane specs
-	print("Loading plane specs...")
+	# Load plane specs from planes.xlsx (AFTER fetching airplanes, BEFORE airports)
+	print("Loading plane specs from planes.xlsx...")
 	from load_plane_specs import load_plane_specs_from_file
 	load_plane_specs_from_file()
 
@@ -337,8 +337,8 @@ def main():
 
 def _get_airports_from_sample_jobs() -> set:
 	"""Extract all unique airports from sample jobs in planes.xlsx."""
-	project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-	excel_path = os.path.join(project_root, "planes.xlsx")
+	current_dir = os.path.dirname(os.path.abspath(__file__))
+	excel_path = os.path.join(current_dir, "planes.xlsx")
 	
 	if not os.path.exists(excel_path):
 		return set()

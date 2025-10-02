@@ -28,10 +28,10 @@ def load_plane_specs_from_file(file_path: str = None, sheet_name: str = "Planes"
 	dbmod.init_db(cfg.db_path)
 	dbmod.migrate_schema(cfg.db_path)
 	
-	# Get project root directory if no file path provided
+	# Get current directory if no file path provided
 	if file_path is None:
-		project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-		file_path = os.path.join(project_root, "planes.xlsx")
+		current_dir = os.path.dirname(os.path.abspath(__file__))
+		file_path = os.path.join(current_dir, "planes.xlsx")
 
 	if not os.path.exists(file_path):
 		print(f"File not found: {file_path}")
@@ -60,11 +60,11 @@ def load_plane_specs_from_file(file_path: str = None, sheet_name: str = "Planes"
 
 
 def main(argv=None) -> int:
-	# Get project root directory
-	project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+	# Get current directory (where planes.xlsx is located)
+	current_dir = os.path.dirname(os.path.abspath(__file__))
 	
 	parser = argparse.ArgumentParser(description="Load plane specs from planes.xlsx Planes sheet")
-	parser.add_argument("--file", default=os.path.join(project_root, "planes.xlsx"), help="Path to planes.xlsx")
+	parser.add_argument("--file", default=os.path.join(current_dir, "planes.xlsx"), help="Path to planes.xlsx")
 	parser.add_argument("--sheet", default="Planes", help="Sheet name containing specs")
 	args = parser.parse_args(argv)
 

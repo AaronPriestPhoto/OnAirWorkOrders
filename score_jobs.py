@@ -146,6 +146,7 @@ def _score_job_for_plane(airports, plane_spec, job_id, job, legs, optimizer=None
 	max_range = max(plane_spec["range1_nm"] or 0, plane_spec["range2_nm"] or 0)
 	if (job["computed_distance_nm"] or 0) > max_range:
 		return (0, "Job distance exceeds max range", 0.0, 0.0, 0.0)
+	
 	flight_hours = 0.0
 	for leg in legs:
 		f = (leg["from_icao"] or "").upper()
