@@ -787,7 +787,10 @@ def main():
                        help="Maximum hours for work orders (default: 24.0)")
     parser.add_argument("--epsilon-hours", type=float, default=0.5,
                        help="Epsilon soft limit in hours (default: 0.5)")
-    parser.add_argument("--csv", help="Output CSV file path")
+    parser.add_argument("--csv", default="workorders.csv", 
+                       help="Output CSV file path (default: workorders.csv)")
+    parser.add_argument("--no-csv", action="store_true",
+                       help="Skip CSV export")
     
     args = parser.parse_args()
     
@@ -817,10 +820,12 @@ def main():
     # Print results
     print_work_orders(work_orders)
     
-    # Export to CSV if requested
-    if args.csv and work_orders:
+    # Export to CSV by default (unless --no-csv is specified)
+    if not args.no_csv and work_orders:
         export_to_csv(work_orders, args.csv)
         print(f"\nWork orders exported to: {args.csv}")
+    elif not work_orders:
+        print("\nNo work orders generated.")
     
     return 0
 

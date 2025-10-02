@@ -141,6 +141,8 @@ def main():
 					help="Include passenger/PAX jobs (default: cargo-only)")
 	parser.add_argument("--enable-human-only-jobs", action="store_true", 
 					help="Include human-only jobs (default: automated only)")
+	parser.add_argument("--no-work-orders", action="store_true",
+					help="Skip automatic work order generation")
 	args = parser.parse_args()
 
 	config = cfg_mod.load_config()
@@ -173,6 +175,14 @@ def main():
 		print("Scoring jobs...")
 		from score_jobs import main as score_jobs_main
 		score_jobs_main()
+		
+		# Generate work orders automatically (unless disabled)
+		if not args.no_work_orders:
+			print("Generating work orders...")
+			from work_order_generator import main as work_order_main
+			work_order_main()
+		else:
+			print("Skipping work order generation (--no-work-orders specified)")
 		
 		return 0
 
@@ -331,6 +341,14 @@ def main():
 	print("Scoring jobs...")
 	from score_jobs import main as score_jobs_main
 	score_jobs_main()
+
+	# Generate work orders automatically (unless disabled)
+	if not args.no_work_orders:
+		print("Generating work orders...")
+		from work_order_generator import main as work_order_main
+		work_order_main()
+	else:
+		print("Skipping work order generation (--no-work-orders specified)")
 
 	return 0
 
