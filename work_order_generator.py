@@ -219,6 +219,37 @@ class WorkOrderGenerator:
         
         return nearest_icao
     
+    def _calculate_distance_between_airports(self, icao1: str, icao2: str) -> float:
+        """Calculate distance between two airports using Haversine formula."""
+        with db_mod.connect(self.db_path) as conn:
+            # Get coordinates for both airports
+            coords1 = conn.execute("SELECT latitude, longitude FROM airports WHERE icao = ?", (icao1,)).fetchone()
+            coords2 = conn.execute("SELECT latitude, longitude FROM airports WHERE icao = ?", (icao2,)).fetchone()
+            
+            if not coords1 or not coords2:
+                return 0.0
+            
+            lat1, lon1 = coords1
+            lat2, lon2 = coords2
+            
+            # Haversine formula for great circle distance
+            from math import radians, cos, sin, asin, sqrt
+            
+            # Convert to radians
+            lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+            
+            # Haversine formula
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+            c = 2 * asin(sqrt(a))
+            
+            # Earth's radius in nautical miles
+            r = 3440.065  # nm
+            distance = c * r
+            
+            return distance
+    
     def load_feasible_jobs_for_plane(self, plane: PlaneInfo) -> None:
         """Load all feasible jobs for a specific plane."""
         with db_mod.connect(self.db_path) as conn:
@@ -322,14 +353,34 @@ class WorkOrderGenerator:
                 speed = self.optimizer.get_optimized_speed(
                     plane.plane_type, distance, payload, dep_size, dest_size
                 )
+                
+                # If optimizer returns 0 (plane not in performance curves), fall back to base speed
+                if speed <= 0:
+                    speed = self._get_base_speed(plane.plane_type)
             else:
                 # Fallback to base speed from plane specs
                 speed = self._get_base_speed(plane.plane_type)
             
-            if speed > 0:
-                total_hours += distance / speed
+            # Final safety check - ensure we have a valid speed
+            if speed <= 0:
+                print(f"Warning: Invalid speed {speed} for plane {plane.plane_type}, using default fallback")
+                speed = 200.0  # Absolute fallback speed
+            
+            # Calculate flight hours for this leg
+            if speed > 0 and distance > 0:
+                leg_hours = distance / speed
+                total_hours += leg_hours
+            elif distance > 0:
+                # If we have distance but no speed, something is wrong
+                print(f"Warning: Distance {distance}nm but speed {speed}kts for plane {plane.plane_type}")
         
-        avg_speed = total_distance / total_hours if total_hours > 0 else self._get_base_speed(plane.plane_type)
+        # Calculate average speed
+        if total_hours > 0:
+            avg_speed = total_distance / total_hours
+        else:
+            # If no hours calculated, use base speed as fallback
+            avg_speed = self._get_base_speed(plane.plane_type)
+        
         return total_hours, avg_speed
     
     def _calculate_flight_hours(self, plane: PlaneInfo, legs: List[Dict[str, Any]]) -> float:
@@ -528,6 +579,15 @@ class WorkOrderGenerator:
                             break
                     
                     if best_hub_job:
+                        # Calculate actual distance for transit leg
+                        transit_distance = self._calculate_distance_between_airports(
+                            current_location, best_hub_job.legs[0]['from_icao']
+                        )
+                        
+                        # Calculate actual flight hours for transit leg
+                        transit_speed = self._get_base_speed(plane.plane_type)
+                        transit_flight_hours = transit_distance / transit_speed if transit_speed > 0 else best_hub_job.hub_penalty_hours
+                        
                         # Add transit time as a "virtual job" to account for flying to hub
                         transit_job = JobInfo(
                             job_id=f"transit_{plane.plane_id}_{best_hub_job.legs[0]['from_icao']}",
@@ -535,18 +595,17 @@ class WorkOrderGenerator:
                             destination=best_hub_job.legs[0]['from_icao'],
                             pay=0.0,
                             xp=0.0,
-                            distance_nm=0.0,  # Will be calculated if needed
+                            distance_nm=transit_distance,
                             pay_per_hour=0.0,
                             xp_per_hour=0.0,
                             balance_score=0.0,
-                            flight_hours=best_hub_job.hub_penalty_hours,
+                            flight_hours=transit_flight_hours,
                             time_remaining_hours=999.0,  # Transit jobs don't expire
-                            legs=[{
-                                'from_icao': current_location,
-                                'to_icao': best_hub_job.legs[0]['from_icao'],
-                                'distance_nm': 0.0,
-                                'cargo_lbs': 0.0
-                            }]
+                            source="transit",
+                            speed_kts=transit_speed,
+                            route=f"{current_location} -> {best_hub_job.legs[0]['from_icao']}",
+                            legs_count=0,  # Transit legs don't count as actual job legs
+                            legs=[]  # Empty legs for transit jobs
                         )
                         
                         work_order.add_job(transit_job, work_order.total_hours)
