@@ -499,6 +499,19 @@ class WorkOrderGenerator:
             
             chainable.append(job)
         
+        # Debug: Add debug info for PANO planes
+        if 'PANO' in plane.registration:
+            print(f"    DEBUG find_chainable_jobs: {plane.registration}")
+            print(f"    DEBUG - Current location: {current_location}")
+            print(f"    DEBUG - Remaining hours: {remaining_hours}")
+            print(f"    DEBUG - Epsilon hours: {epsilon_hours}")
+            print(f"    DEBUG - Available jobs: {len([j for j in plane.feasible_jobs if j.job_id not in self.used_jobs])}")
+            for job in plane.feasible_jobs:
+                if job.job_id not in self.used_jobs:
+                    print(f"    DEBUG - Job {job.job_id}: from {job.legs[0]['from_icao'] if job.legs else 'None'}, hours {job.flight_hours:.2f}")
+                    if job.legs and job.legs[0]['from_icao'].upper() == current_location.upper():
+                        print(f"    DEBUG - Job {job.job_id}: location matches, hours {job.flight_hours:.2f} vs limit {remaining_hours + epsilon_hours:.2f}")
+        
         return chainable
     
     def find_jobs_from_major_hubs(self, plane: PlaneInfo, max_hours: float = 24.0) -> List[JobInfo]:
@@ -536,15 +549,31 @@ class WorkOrderGenerator:
         return hub_jobs
     
     def _calculate_hub_transit_time(self, plane: PlaneInfo, from_icao: str, to_icao: str) -> float:
-        """Calculate transit time from current location to a job hub."""
-        # This is a simplified calculation - in reality you'd want to use actual distances
-        # For now, assume a reasonable transit time based on plane type
-        if plane.plane_type.startswith('Antonov'):
-            return 2.0  # 2 hours transit for large cargo planes
-        elif plane.plane_type.startswith('Rockwell'):
-            return 1.5  # 1.5 hours for bombers
+        """Calculate transit time from current location to a job hub using actual distance and optimized speed."""
+        # Calculate actual distance between airports
+        distance = self._calculate_distance_between_airports(from_icao, to_icao)
+        
+        if distance <= 0:
+            # Fallback to a reasonable estimate if distance calculation fails
+            return 1.0
+        
+        # Get optimized speed for transit leg (empty cargo, default airport sizes)
+        if self.optimizer and plane.plane_type:
+            transit_speed = self.optimizer.get_optimized_speed(
+                plane.plane_type, distance, 0.0, 3, 3
+            )
+            # If optimizer returns 0 (no performance data), fall back to base speed
+            if transit_speed <= 0:
+                transit_speed = self._get_base_speed(plane.plane_type)
         else:
-            return 1.0  # 1 hour for smaller planes
+            transit_speed = self._get_base_speed(plane.plane_type)
+        
+        # Calculate actual transit time
+        if transit_speed > 0:
+            return distance / transit_speed
+        else:
+            # Fallback if no speed available
+            return 1.0
     
     def generate_work_order(self, plane: PlaneInfo, max_hours: float = 24.0, 
                            epsilon_hours: float = 0.5) -> WorkOrder:
@@ -828,6 +857,26 @@ class WorkOrderGenerator:
                 print(f"  Generated work order with {len(work_order.jobs)} jobs, {work_order.total_hours:.2f} hours")
             else:
                 print(f"  No suitable job chain found for {plane.registration}")
+                # Debug: Check what happened for PANO planes
+                if 'PANO' in plane.registration:
+                    print(f"    DEBUG: {plane.registration} - Feasible jobs: {len(plane.feasible_jobs)}")
+                    print(f"    DEBUG: {plane.registration} - Used jobs count: {len(self.used_jobs)}")
+                    if plane.feasible_jobs:
+                        available_jobs = [job for job in plane.feasible_jobs if job.job_id not in self.used_jobs]
+                        print(f"    DEBUG: {plane.registration} - Available jobs: {len(available_jobs)}")
+                        if available_jobs:
+                            print(f"    DEBUG: {plane.registration} - First available job: {available_jobs[0].job_id}")
+                            # Check if this job can be chained
+                            chainable = self.find_chainable_jobs(plane, plane.current_location, max_hours, epsilon_hours)
+                            print(f"    DEBUG: {plane.registration} - Chainable jobs: {len(chainable)}")
+                            if chainable:
+                                print(f"    DEBUG: {plane.registration} - Chainable job: {chainable[0].job_id}")
+                            else:
+                                print(f"    DEBUG: {plane.registration} - No chainable jobs found")
+                        else:
+                            print(f"    DEBUG: {plane.registration} - All jobs already used")
+                    else:
+                        print(f"    DEBUG: {plane.registration} - No feasible jobs")
         
         return work_orders
 
