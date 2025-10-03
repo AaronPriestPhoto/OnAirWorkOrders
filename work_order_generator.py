@@ -584,8 +584,18 @@ class WorkOrderGenerator:
                             current_location, best_hub_job.legs[0]['from_icao']
                         )
                         
-                        # Calculate actual flight hours for transit leg
-                        transit_speed = self._get_base_speed(plane.plane_type)
+                        # Calculate actual flight hours for transit leg using optimized speed if available
+                        if self.optimizer and plane.plane_type:
+                            # Use optimized speed for transit leg (empty cargo, default airport sizes)
+                            transit_speed = self.optimizer.get_optimized_speed(
+                                plane.plane_type, transit_distance, 0.0, 3, 3
+                            )
+                            # If optimizer returns 0 (no performance data), fall back to base speed
+                            if transit_speed <= 0:
+                                transit_speed = self._get_base_speed(plane.plane_type)
+                        else:
+                            transit_speed = self._get_base_speed(plane.plane_type)
+                        
                         transit_flight_hours = transit_distance / transit_speed if transit_speed > 0 else best_hub_job.hub_penalty_hours
                         
                         # Add transit time as a "virtual job" to account for flying to hub
@@ -645,11 +655,31 @@ class WorkOrderGenerator:
             self._optimize_work_order_second_pass(work_order, plane, current_location, 
                                                  max_hours, epsilon_hours)
         
+        # Remove trailing transit legs (they provide no Pay/XP value)
+        self._remove_trailing_transit_legs(work_order)
+        
         # Optimize job order to minimize penalties while preserving chaining
         if len(work_order.jobs) > 1:
             self._optimize_job_order_for_penalties(work_order)
         
         return work_order
+    
+    def _remove_trailing_transit_legs(self, work_order: WorkOrder) -> None:
+        """Remove trailing transit legs from work order since they provide no Pay/XP value."""
+        if not work_order.jobs:
+            return
+        
+        # Remove transit legs from the end of the work order
+        while work_order.jobs and work_order.jobs[-1].source == "transit":
+            removed_job = work_order.jobs.pop()
+            # Update totals
+            work_order.total_hours -= removed_job.flight_hours
+            work_order.total_pay -= removed_job.pay
+            work_order.total_xp -= removed_job.xp
+            work_order.total_adjusted_pay -= removed_job.adjusted_pay_total
+        
+        # Recalculate totals to ensure consistency
+        self._recalculate_work_order_totals(work_order)
     
     def _optimize_work_order_second_pass(self, work_order: WorkOrder, plane: PlaneInfo,
                                         current_location: str, max_hours: float, 
