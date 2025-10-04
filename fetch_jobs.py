@@ -74,6 +74,9 @@ def _build_job_legs_and_distances(db_path: str) -> int:
 	# Clear existing legs
 	db_mod.clear_job_legs(db_path)
 	inserted = 0
+	all_legs = []
+	all_distances = []
+	
 	with db_mod.connect(db_path) as conn:
 		cur = conn.cursor()
 		rows = cur.execute("SELECT id, data_json FROM jobs").fetchall()
@@ -97,10 +100,18 @@ def _build_job_legs_and_distances(db_path: str) -> int:
 				dist = 0.0
 				if from_lat is not None and from_lon is not None and to_lat is not None and to_lon is not None:
 					dist = _haversine_nm(from_lat, from_lon, to_lat, to_lon)
-				db_mod.upsert_job_leg(db_path, leg["job_id"], leg["leg_index"], f, t, from_lat or 0.0, from_lon or 0.0, to_lat or 0.0, to_lon or 0.0, dist, leg.get("cargo_lbs"))
+				
+				all_legs.append((leg["job_id"], leg["leg_index"], f, t, from_lat or 0.0, from_lon or 0.0, to_lat or 0.0, to_lon or 0.0, dist, leg.get("cargo_lbs")))
 				total_nm += dist
 			inserted += len(legs)
-			db_mod.update_job_total_distance(db_path, job_id, total_nm)
+			all_distances.append((total_nm, job_id))
+	
+	# Bulk insert all legs and update distances
+	if all_legs:
+		db_mod.upsert_job_legs_bulk(db_path, all_legs)
+	if all_distances:
+		db_mod.update_job_total_distances_bulk(db_path, all_distances)
+	
 	return inserted
 
 

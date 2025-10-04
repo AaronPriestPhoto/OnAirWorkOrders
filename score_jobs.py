@@ -142,15 +142,19 @@ def _score_job_for_plane(airports, plane_spec, job_id, job, legs, optimizer=None
 	reason = "OK"
 	base_speed = plane_spec["speed_kts"] or 0
 	min_sz = int(plane_spec.get("min_airport_size") or 0)
-	# Use the maximum of both ranges to determine if job is feasible
+	# Get the maximum range for individual leg checks
 	max_range = max(plane_spec["range1_nm"] or 0, plane_spec["range2_nm"] or 0)
-	if (job["computed_distance_nm"] or 0) > max_range:
-		return (0, "Job distance exceeds max range", 0.0, 0.0, 0.0)
 	
 	flight_hours = 0.0
 	for leg in legs:
 		f = (leg["from_icao"] or "").upper()
 		t = (leg["to_icao"] or "").upper()
+		leg_distance = leg["distance_nm"] or 0
+		
+		# Check individual leg range - each leg must be within max range
+		if leg_distance > max_range:
+			return (0, f"Leg distance {leg_distance:.0f}nm exceeds max range {max_range:.0f}nm", 0.0, 0.0, 0.0)
+		
 		# airport sizes
 		fsz = airports.get(f, 0)
 		tsz = airports.get(t, 0)
@@ -158,16 +162,17 @@ def _score_job_for_plane(airports, plane_spec, job_id, job, legs, optimizer=None
 			return (0, f"Departure {f} below min airport size {min_sz}", 0.0, 0.0, 0.0)
 		if tsz < min_sz:
 			return (0, f"Destination {t} below min airport size {min_sz}", 0.0, 0.0, 0.0)
-		# payload
-		cap = _calculate_payload_range_limit(plane_spec, leg["distance_nm"] or 0)
+		
+		# payload - calculate per leg based on leg distance
+		cap = _calculate_payload_range_limit(plane_spec, leg_distance)
 		if (leg["cargo_lbs"] or 0) > cap:
-			return (0, f"Leg cargo exceeds capacity for {leg['distance_nm']:.0f}nm", 0.0, 0.0, 0.0)
+			return (0, f"Leg cargo exceeds capacity for {leg_distance:.0f}nm", 0.0, 0.0, 0.0)
 		
 		# Use optimized speed if available, otherwise fall back to base speed
 		if optimizer and plane_type:
 			optimized_speed = optimizer.get_optimized_speed(
 				plane_type, 
-				leg["distance_nm"] or 0, 
+				leg_distance, 
 				leg["cargo_lbs"] or 0, 
 				fsz, 
 				tsz
@@ -178,7 +183,7 @@ def _score_job_for_plane(airports, plane_spec, job_id, job, legs, optimizer=None
 		
 		if speed <= 0:
 			return (0, "Plane speed is 0", 0.0, 0.0, 0.0)
-		flight_hours += (leg["distance_nm"] or 0) / speed
+		flight_hours += leg_distance / speed
 	if flight_hours <= 0:
 		return (0, "Computed flight time is 0", 0.0, 0.0, 0.0)
 	pph = (job["pay"] or 0.0) / flight_hours
@@ -202,6 +207,7 @@ def main():
 		print("No performance optimization data found, using default calculations")
 	
 	with db_mod.connect(db_path) as conn:
+		print("Loading airports, jobs, and planes into memory...")
 		airports = _load_airports(conn)
 		jobs, legs_by_job = _load_jobs_and_legs(conn)
 		planes = _load_planes(conn)
@@ -212,6 +218,7 @@ def main():
 			sp = _get_plane_specs(conn, p, p, {})
 			if sp:
 				plane_specs_cache[p] = sp
+		print(f"Loaded {len(airports)} airports, {len(jobs)} jobs, {len(planes)} planes, {len(plane_specs_cache)} plane specs")
 
 	# Compute in memory with progress bar
 	bulk = []
@@ -243,10 +250,12 @@ def main():
 	
 	progress.close()
 
-	# Write in bulk
+	# Write in bulk - clear existing scores first, then insert all new scores
+	print(f"Writing {len(bulk)} job scores to database...")
 	db_mod.clear_job_scores(db_path)
 	if bulk:
 		db_mod.upsert_job_scores_bulk(db_path, bulk)
+	print(f"Successfully wrote {len(bulk)} job scores to database")
 	print(f"Scores computed for {len(planes)} planes (all statuses)")
 	return 0
 

@@ -16,8 +16,11 @@ Features:
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
+import shutil
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -53,6 +56,84 @@ class JobInfo:
     legs_count: int = 0
     hub_penalty_hours: float = 0.0
     legs: List[Dict[str, Any]] = field(default_factory=list)
+    # Multi-job support
+    total_payload_lbs: float = 0.0  # Total cargo weight for this job
+    delivery_waypoint: Optional[str] = None  # Which waypoint this job gets delivered at
+
+
+@dataclass
+class MultiJobLeg:
+    """A leg that can carry multiple jobs simultaneously."""
+    from_icao: str
+    to_icao: str
+    distance_nm: float
+    jobs: List[JobInfo] = field(default_factory=list)
+    total_payload_lbs: float = 0.0
+    flight_hours: float = 0.0
+    speed_kts: float = 0.0
+    
+    def add_job(self, job: JobInfo) -> None:
+        """Add a job to this leg."""
+        self.jobs.append(job)
+        self.total_payload_lbs += job.total_payload_lbs
+    
+    def can_add_job(self, job: JobInfo, plane_spec: Dict[str, Any]) -> Tuple[bool, str]:
+        """Check if a job can be added to this leg considering payload and range constraints."""
+        # Check if job's route includes this leg
+        if not self._job_uses_this_leg(job):
+            return False, "Job doesn't use this leg"
+        
+        # Calculate new total payload
+        new_total_payload = self.total_payload_lbs + job.total_payload_lbs
+        
+        # Check payload capacity for this distance
+        max_payload = self._calculate_payload_range_limit(plane_spec, self.distance_nm)
+        if new_total_payload > max_payload:
+            return False, f"Combined payload {new_total_payload:.0f}lbs exceeds capacity {max_payload:.0f}lbs for {self.distance_nm:.0f}nm"
+        
+        return True, "OK"
+    
+    def _job_uses_this_leg(self, job: JobInfo) -> bool:
+        """Check if a job's route includes this leg."""
+        for leg in job.legs:
+            if (leg['from_icao'].upper() == self.from_icao.upper() and 
+                leg['to_icao'].upper() == self.to_icao.upper()):
+                return True
+        return False
+    
+    def _calculate_payload_range_limit(self, plane_spec: Dict[str, Any], distance_nm: float) -> float:
+        """Calculate maximum payload for given distance (copied from score_jobs.py)."""
+        max_range = max(plane_spec["range1_nm"] or 0, plane_spec["range2_nm"] or 0)
+        max_payload = max(plane_spec["payload1_lbs"] or 0, plane_spec["payload2_lbs"] or 0)
+        
+        if distance_nm > max_range:
+            return 0
+        
+        if plane_spec["range1_nm"] == plane_spec["range2_nm"]:
+            return max_payload
+        
+        if plane_spec["payload1_lbs"] == plane_spec["payload2_lbs"]:
+            return plane_spec["payload1_lbs"]
+        
+        # Sort the range/payload pairs
+        if plane_spec["range1_nm"] > plane_spec["range2_nm"]:
+            r1, p1 = plane_spec["range2_nm"], plane_spec["payload2_lbs"]
+            r2, p2 = plane_spec["range1_nm"], plane_spec["payload1_lbs"]
+        else:
+            r1, p1 = plane_spec["range1_nm"], plane_spec["payload1_lbs"]
+            r2, p2 = plane_spec["range2_nm"], plane_spec["payload2_lbs"]
+        
+        if r1 == r2:
+            return max_payload if distance_nm <= r1 else 0
+        
+        if distance_nm <= r1:
+            return max(p1, p2)
+        elif distance_nm >= r2:
+            return min(p1, p2)
+        else:
+            m = (p2 - p1) / (r2 - r1)
+            calculated_payload = p1 + m * (distance_nm - r1)
+            return min(calculated_payload, max_payload)
 
 
 @dataclass
@@ -75,6 +156,7 @@ class WorkOrder:
     plane_type: str
     priority: str
     jobs: List[JobInfo] = field(default_factory=list)
+    multi_job_legs: List[MultiJobLeg] = field(default_factory=list)  # New: legs that can carry multiple jobs
     total_hours: float = 0.0
     total_pay: float = 0.0
     total_xp: float = 0.0
@@ -115,20 +197,166 @@ class WorkOrder:
     def get_priority_score(self, job: JobInfo) -> float:
         """Get the priority score for a job based on plane priority."""
         if self.priority == "pay":
-            return job.adjusted_pay_per_hour if hasattr(job, 'adjusted_pay_per_hour') else job.pay_per_hour
+            # Use adjusted pay per hour if it's been calculated, otherwise use regular pay per hour
+            return job.adjusted_pay_per_hour if job.adjusted_pay_per_hour > 0 else job.pay_per_hour
         elif self.priority == "xp":
             return job.xp_per_hour
         else:  # balance
             return job.balance_score
+    
+    def add_multi_job_leg(self, leg: MultiJobLeg) -> None:
+        """Add a multi-job leg to the work order."""
+        self.multi_job_legs.append(leg)
+        
+        # Recalculate job metrics for multi-job legs
+        self._recalculate_multi_job_leg_metrics(leg)
+        
+        # Update totals based on all jobs in this leg
+        for job in leg.jobs:
+            self.total_pay += job.pay
+            self.total_xp += job.xp
+            self.total_adjusted_pay += job.adjusted_pay_total
+        self.total_hours += leg.flight_hours
+    
+    def _recalculate_multi_job_leg_metrics(self, leg: MultiJobLeg) -> None:
+        """Recalculate pay/XP per hour metrics for jobs in a multi-job leg."""
+        if leg.flight_hours <= 0:
+            return
+        
+        # Calculate combined totals for the leg
+        total_pay = sum(job.pay for job in leg.jobs)
+        total_xp = sum(job.xp for job in leg.jobs)
+        
+        # Calculate combined metrics
+        combined_pay_per_hour = total_pay / leg.flight_hours
+        combined_xp_per_hour = total_xp / leg.flight_hours
+        combined_balance_score = (combined_pay_per_hour / 1_000_000 + combined_xp_per_hour / 100) / 2 if (combined_pay_per_hour > 0 and combined_xp_per_hour > 0) else (combined_pay_per_hour or combined_xp_per_hour)
+        
+        # Update each job's metrics to reflect the combined leg performance
+        for job in leg.jobs:
+            # Calculate this job's share of the combined metrics
+            job_share = job.pay / total_pay if total_pay > 0 else 1.0 / len(leg.jobs)
+            
+            # Update the job's per-hour metrics to reflect the actual leg performance
+            job.pay_per_hour = combined_pay_per_hour * job_share
+            job.xp_per_hour = combined_xp_per_hour * job_share
+            job.balance_score = combined_balance_score * job_share
+    
+    def can_add_job_to_leg(self, job: JobInfo, leg: MultiJobLeg, plane_spec: Dict[str, Any]) -> Tuple[bool, str]:
+        """Check if a job can be added to an existing leg."""
+        return leg.can_add_job(job, plane_spec)
+    
+    def get_all_jobs(self) -> List[JobInfo]:
+        """Get all jobs from both regular jobs and multi-job legs."""
+        all_jobs = list(self.jobs)
+        for leg in self.multi_job_legs:
+            all_jobs.extend(leg.jobs)
+        return all_jobs
+    
+    def get_all_job_ids(self) -> Set[str]:
+        """Get all job IDs from both regular jobs and multi-job legs."""
+        job_ids = set()
+        for job in self.jobs:
+            job_ids.add(job.job_id)
+        for leg in self.multi_job_legs:
+            for job in leg.jobs:
+                job_ids.add(job.job_id)
+        return job_ids
+    
+    def get_final_destination(self) -> str:
+        """Get the final destination of the work order."""
+        if self.multi_job_legs:
+            return self.multi_job_legs[-1].to_icao
+        elif self.jobs:
+            return self.jobs[-1].destination
+        return ""
 
 
 class WorkOrderGenerator:
     """Generates optimized work orders for idle planes."""
     
     def __init__(self, db_path: str, optimizer: Optional[PerformanceOptimizer] = None):
-        self.db_path = db_path
+        self.original_db_path = db_path
         self.optimizer = optimizer
         self.used_jobs: Set[str] = set()
+        
+        # Performance optimization: Load entire database into RAM
+        self._ram_db_path = self._create_ram_database()
+        self._used_jobs_tracking: Set[str] = set()  # Track used jobs in memory only
+        
+        # Cache for expensive calculations
+        self._distance_cache: Dict[Tuple[str, str], float] = {}
+        self._airport_size_cache: Dict[str, int] = {}
+        
+        print(f"Database loaded into RAM at: {self._ram_db_path}")
+    
+    @property
+    def db_path(self) -> str:
+        """Get the current database path (RAM database during processing)."""
+        return self._ram_db_path
+    
+    def _create_ram_database(self) -> str:
+        """Create a copy of the database in RAM for ultra-fast access."""
+        print("Creating RAM database for ultra-fast processing...")
+        
+        # Use a more efficient approach: create in temp directory but avoid unnecessary copying
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.db', prefix='onair_ram_', dir=tempfile.gettempdir())
+        os.close(temp_fd)  # Close the file descriptor, we'll use the path
+        
+        try:
+            # Copy the original database to the temporary location
+            # Use copyfile instead of copy2 to avoid copying metadata
+            shutil.copyfile(self.original_db_path, temp_path)
+            print(f"Database copied to RAM: {temp_path}")
+            return temp_path
+        except Exception as e:
+            print(f"Error creating RAM database: {e}")
+            # Fallback to original database
+            return self.original_db_path
+    
+    def _save_ram_database_to_disk(self) -> None:
+        """Save the RAM database back to the original disk location."""
+        if self._ram_db_path == self.original_db_path:
+            return  # No need to save if we're using the original database
+        
+        print("Saving RAM database back to disk...")
+        try:
+            # Only create backup if the original database exists and is different
+            if os.path.exists(self.original_db_path):
+                backup_path = f"{self.original_db_path}.backup"
+                shutil.copyfile(self.original_db_path, backup_path)
+                print(f"Created backup: {backup_path}")
+            
+            # Copy the RAM database back to the original location
+            shutil.copyfile(self._ram_db_path, self.original_db_path)
+            print(f"Saved RAM database to: {self.original_db_path}")
+            
+            # Clean up the temporary RAM database
+            os.unlink(self._ram_db_path)
+            print("Cleaned up RAM database")
+            
+        except Exception as e:
+            print(f"Error saving RAM database: {e}")
+            print("Original database backup should be available")
+    
+    
+    def write_used_jobs_to_database(self) -> None:
+        """Write used jobs to database and save entire RAM database back to disk."""
+        if self._used_jobs_tracking:
+            print(f"Writing {len(self._used_jobs_tracking)} used jobs to database...")
+            with db_mod.connect(self.db_path) as conn:
+                # Batch update job_scores table to mark jobs as used
+                job_ids = list(self._used_jobs_tracking)
+                conn.executemany("""
+                    UPDATE job_scores 
+                    SET feasible = 0 
+                    WHERE job_id = ?
+                """, [(job_id,) for job_id in job_ids])
+                conn.commit()
+            print(f"Successfully marked {len(self._used_jobs_tracking)} jobs as used in database")
+        
+        # Save the entire RAM database back to disk
+        self._save_ram_database_to_disk()
         
     def get_idle_planes(self) -> List[PlaneInfo]:
         """Get all idle planes sorted by priority and registration."""
@@ -220,35 +448,44 @@ class WorkOrderGenerator:
         return nearest_icao
     
     def _calculate_distance_between_airports(self, icao1: str, icao2: str) -> float:
-        """Calculate distance between two airports using Haversine formula."""
+        """Calculate distance between two airports using cached Haversine formula."""
+        # Check cache first
+        cache_key = (icao1.upper(), icao2.upper())
+        if cache_key in self._distance_cache:
+            return self._distance_cache[cache_key]
+        
+        # Direct database query (now using RAM database for speed)
         with db_mod.connect(self.db_path) as conn:
             # Get coordinates for both airports
             coords1 = conn.execute("SELECT latitude, longitude FROM airports WHERE icao = ?", (icao1,)).fetchone()
             coords2 = conn.execute("SELECT latitude, longitude FROM airports WHERE icao = ?", (icao2,)).fetchone()
             
             if not coords1 or not coords2:
+                self._distance_cache[cache_key] = 0.0
                 return 0.0
             
             lat1, lon1 = coords1
             lat2, lon2 = coords2
-            
-            # Haversine formula for great circle distance
-            from math import radians, cos, sin, asin, sqrt
-            
-            # Convert to radians
-            lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-            
-            # Haversine formula
-            dlat = lat2 - lat1
-            dlon = lon2 - lon1
-            a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-            c = 2 * asin(sqrt(a))
-            
-            # Earth's radius in nautical miles
-            r = 3440.065  # nm
-            distance = c * r
-            
-            return distance
+        
+        # Haversine formula for great circle distance
+        from math import radians, cos, sin, asin, sqrt
+        
+        # Convert to radians
+        lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+        
+        # Haversine formula
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+        c = 2 * asin(sqrt(a))
+        
+        # Earth's radius in nautical miles
+        r = 3440.065  # nm
+        distance = c * r
+        
+        # Cache the result
+        self._distance_cache[cache_key] = distance
+        return distance
     
     def load_feasible_jobs_for_plane(self, plane: PlaneInfo) -> None:
         """Load all feasible jobs for a specific plane."""
@@ -267,8 +504,8 @@ class WorkOrderGenerator:
             for row in rows:
                 job_id, pph, xph, balance, dep, dest, pay, xp, dist, source = row
                 
-                # Skip jobs that are already used
-                if job_id in self.used_jobs:
+                # Skip jobs that are already used (using memory tracking)
+                if job_id in self._used_jobs_tracking:
                     continue
                 
                 # Get job legs
@@ -287,6 +524,9 @@ class WorkOrderGenerator:
                 # Calculate route and min airport size
                 route_str, min_airport_size = self._calculate_route_info(conn, legs)
                 
+                # Calculate total payload for this job
+                total_payload = sum(leg.get('cargo_lbs', 0.0) for leg in legs)
+                
                 job_info = JobInfo(
                     job_id=job_id,
                     departure=actual_departure,
@@ -304,8 +544,13 @@ class WorkOrderGenerator:
                     min_airport_size=min_airport_size,
                     route=route_str,
                     legs_count=len(legs),
-                    legs=legs
+                    legs=legs,
+                    total_payload_lbs=total_payload
                 )
+                
+                # Calculate adjusted pay values (penalty_amount defaults to 0.0)
+                job_info.adjusted_pay_total = job_info.pay - job_info.penalty_amount
+                job_info.adjusted_pay_per_hour = job_info.adjusted_pay_total / job_info.flight_hours if job_info.flight_hours > 0 else 0.0
                 
                 jobs.append(job_info)
             
@@ -428,6 +673,7 @@ class WorkOrderGenerator:
     
     def _get_base_speed(self, plane_type: str) -> float:
         """Get base cruise speed for a plane type."""
+        # Direct database query (now using RAM database for speed)
         with db_mod.connect(self.db_path) as conn:
             # First try plane_specs table (optimization data from planes.xlsx)
             row = conn.execute("SELECT cruise_speed_kts FROM plane_specs WHERE plane_type = ?", (plane_type,)).fetchone()
@@ -484,11 +730,12 @@ class WorkOrderGenerator:
         """Find jobs that can be chained from the current location."""
         chainable = []
         
-        for job in plane.feasible_jobs:
-            # Skip if job is already used
-            if job.job_id in self.used_jobs:
-                continue
-            
+        # Limit to top 100 jobs for better quality while maintaining performance
+        available_jobs = [job for job in plane.feasible_jobs if job.job_id not in self._used_jobs_tracking]
+        available_jobs.sort(key=lambda j: j.balance_score, reverse=True)
+        limited_jobs = available_jobs[:100]  # Consider top 100 jobs for better quality
+        
+        for job in limited_jobs:
             # Check if job departs from current location (use first leg)
             if not job.legs or job.legs[0]['from_icao'].upper() != current_location.upper():
                 continue
@@ -499,24 +746,11 @@ class WorkOrderGenerator:
             
             chainable.append(job)
         
-        # Debug: Add debug info for PANO planes
-        if 'PANO' in plane.registration:
-            print(f"    DEBUG find_chainable_jobs: {plane.registration}")
-            print(f"    DEBUG - Current location: {current_location}")
-            print(f"    DEBUG - Remaining hours: {remaining_hours}")
-            print(f"    DEBUG - Epsilon hours: {epsilon_hours}")
-            print(f"    DEBUG - Available jobs: {len([j for j in plane.feasible_jobs if j.job_id not in self.used_jobs])}")
-            for job in plane.feasible_jobs:
-                if job.job_id not in self.used_jobs:
-                    print(f"    DEBUG - Job {job.job_id}: from {job.legs[0]['from_icao'] if job.legs else 'None'}, hours {job.flight_hours:.2f}")
-                    if job.legs and job.legs[0]['from_icao'].upper() == current_location.upper():
-                        print(f"    DEBUG - Job {job.job_id}: location matches, hours {job.flight_hours:.2f} vs limit {remaining_hours + epsilon_hours:.2f}")
-        
         return chainable
     
     def find_jobs_from_major_hubs(self, plane: PlaneInfo, max_hours: float = 24.0) -> List[JobInfo]:
         """Find jobs from major job hubs that the plane could fly to first."""
-        # Get top job departure airports
+        # Direct database query (now using RAM database for speed)
         with db_mod.connect(self.db_path) as conn:
             top_hubs = conn.execute("""
                 SELECT from_icao, COUNT(DISTINCT job_id) as job_count 
@@ -524,17 +758,33 @@ class WorkOrderGenerator:
                 WHERE from_icao IS NOT NULL 
                 GROUP BY from_icao 
                 ORDER BY job_count DESC 
-                LIMIT 20
+                LIMIT 50
             """).fetchall()
         
         hub_jobs = []
+        
+        # Debug for BONE planes
+        if 'BONE' in plane.registration:
+            print(f"    DEBUG {plane.registration}: Checking {len(top_hubs)} top hubs")
+            for i, (hub_icao, job_count) in enumerate(top_hubs[:10]):  # Show top 10 hubs
+                if hub_icao == plane.current_location:
+                    continue
+                hub_jobs_for_this_hub = []
+                for job in plane.feasible_jobs:
+                    if job.job_id in self._used_jobs_tracking:
+                        continue
+                    if not job.legs or job.legs[0]['from_icao'].upper() != hub_icao.upper():
+                        continue
+                    hub_jobs_for_this_hub.append(job)
+                print(f"    DEBUG {plane.registration}: Hub {hub_icao} has {len(hub_jobs_for_this_hub)} available jobs")
+        
         for hub_icao, job_count in top_hubs:
             if hub_icao == plane.current_location:
                 continue  # Skip if already at this hub
             
             # Find jobs from this hub that are feasible for this plane
             for job in plane.feasible_jobs:
-                if job.job_id in self.used_jobs:
+                if job.job_id in self._used_jobs_tracking:
                     continue
                 
                 if not job.legs or job.legs[0]['from_icao'].upper() != hub_icao.upper():
@@ -547,6 +797,20 @@ class WorkOrderGenerator:
                 hub_jobs.append(job)
         
         return hub_jobs
+    
+    def _get_hub_job_threshold(self, plane_type: str) -> float:
+        """Get hub job threshold based on plane type - smaller planes need lower thresholds."""
+        thresholds = {
+            'Cessna Longitude': 1.0,
+            'Cargo 400M': 2.0, 
+            'Rockwell B-1 Lancer': 3.0,
+            'Concorde': 5.0,
+            'VSKYLABS Skyscenders 76': 2.0,
+            'Hercules H-4': 1.0,
+            'Antonov AN-225-210': 1000.0,  # Keep high for Antonovs
+            'Lockheed SR-71': 10.0
+        }
+        return thresholds.get(plane_type, 5.0)  # Default threshold for unknown types
     
     def _calculate_hub_transit_time(self, plane: PlaneInfo, from_icao: str, to_icao: str) -> float:
         """Calculate transit time from current location to a job hub using actual distance and optimized speed."""
@@ -575,9 +839,243 @@ class WorkOrderGenerator:
             # Fallback if no speed available
             return 1.0
     
+    def find_multi_job_combinations(self, plane: PlaneInfo, current_location: str, 
+                                   remaining_hours: float, plane_spec: Dict[str, Any]) -> List[MultiJobLeg]:
+        """Find optimal combinations of chained jobs that can be carried together."""
+        # Get all feasible jobs from anywhere (not just current location)
+        available_jobs = [job for job in plane.feasible_jobs 
+                         if job.job_id not in self._used_jobs_tracking and job.legs]
+        
+        if not available_jobs:
+            return []
+        
+        multi_job_legs = []
+        
+        # Find chained job combinations
+        # Look for jobs that start from current location and can chain to other jobs
+        starting_jobs = [job for job in available_jobs 
+                        if job.legs[0]['from_icao'].upper() == current_location.upper()]
+        
+        for start_job in starting_jobs:
+            # Find jobs that start where this job ends
+            start_destination = start_job.destination.upper()
+            chained_jobs = [job for job in available_jobs 
+                           if job.job_id != start_job.job_id and 
+                           job.legs[0]['from_icao'].upper() == start_destination]
+            
+            if chained_jobs:
+                # Try to find the best combination of start_job + chained_job(s)
+                best_combination = self._find_chained_job_combination(
+                    start_job, chained_jobs, plane_spec, remaining_hours
+                )
+                
+                if best_combination and len(best_combination) > 1:
+                    # Create a multi-job leg for this chained combination
+                    multi_leg = self._create_chained_multi_job_leg(best_combination)
+                    if multi_leg:
+                        multi_job_legs.append(multi_leg)
+        
+        return multi_job_legs
+    
+    def _find_chained_job_combination(self, start_job: JobInfo, chained_jobs: List[JobInfo], 
+                                    plane_spec: Dict[str, Any], remaining_hours: float) -> Optional[List[JobInfo]]:
+        """Find the best combination of a start job with chained jobs."""
+        if not chained_jobs:
+            return None
+        
+        # Calculate total time for start job
+        start_time = start_job.flight_hours
+        if start_time > remaining_hours:
+            return None
+        
+        # Find the best chained job that fits within remaining time
+        best_chained_job = None
+        best_efficiency = -1
+        
+        for chained_job in chained_jobs:
+            total_time = start_time + chained_job.flight_hours
+            if total_time <= remaining_hours:
+                # Calculate combined efficiency
+                total_pay = start_job.pay + chained_job.pay
+                total_xp = start_job.xp + chained_job.xp
+                combined_efficiency = (total_pay + total_xp) / total_time
+                
+                if combined_efficiency > best_efficiency:
+                    best_efficiency = combined_efficiency
+                    best_chained_job = chained_job
+        
+        if best_chained_job:
+            return [start_job, best_chained_job]
+        return None
+    
+    def _create_chained_multi_job_leg(self, jobs: List[JobInfo]) -> Optional[MultiJobLeg]:
+        """Create a multi-job leg from a chained combination of jobs."""
+        if len(jobs) < 2:
+            return None
+        
+        # For chained jobs, we need to calculate the combined route and timing
+        start_job = jobs[0]
+        end_job = jobs[-1]
+        
+        # Calculate total distance and time
+        total_distance = sum(leg['distance_nm'] for job in jobs for leg in job.legs)
+        total_hours = sum(job.flight_hours for job in jobs)
+        
+        # Calculate average speed
+        avg_speed = total_distance / total_hours if total_hours > 0 else start_job.speed_kts
+        
+        # Create the multi-job leg from start to end
+        multi_leg = MultiJobLeg(
+            from_icao=start_job.departure,
+            to_icao=end_job.destination,
+            distance_nm=total_distance,
+            flight_hours=total_hours,
+            speed_kts=avg_speed
+        )
+        
+        # Add all jobs to the leg
+        for job in jobs:
+            multi_leg.add_job(job)
+        
+        return multi_leg
+    
+    def _find_simple_job_combination(self, jobs: List[JobInfo], plane_spec: Dict[str, Any], 
+                                   remaining_hours: float) -> Optional[List[JobInfo]]:
+        """Find a smart combination of jobs using improved greedy approach."""
+        if not jobs:
+            return None
+        
+        # Sort jobs by pure efficiency score (pay+XP per hour)
+        def job_efficiency_score(job):
+            return (job.pay + job.xp) / job.flight_hours if job.flight_hours > 0 else 0
+        
+        jobs.sort(key=job_efficiency_score, reverse=True)
+        
+        combination = []
+        total_payload = 0.0
+        first_leg = jobs[0].legs[0]
+        distance = first_leg['distance_nm']
+        max_payload = self._calculate_payload_range_limit(plane_spec, distance)
+        
+        # Smart greedy: prioritize jobs that maximize efficiency and payload utilization
+        for job in jobs:
+            # Check if job fits within remaining time
+            if job.flight_hours > remaining_hours:
+                continue
+            
+            # Check payload capacity
+            new_total_payload = total_payload + job.total_payload_lbs
+            if new_total_payload <= max_payload:
+                combination.append(job)
+                total_payload = new_total_payload
+                
+                # Try to fill payload efficiently - stop if we're using >80% of capacity
+                if total_payload > max_payload * 0.8:
+                    break
+                
+                # Limit to 4 jobs max for performance
+                if len(combination) >= 4:
+                    break
+        
+        # Return combination if we have multiple jobs
+        if len(combination) >= 2:
+            return combination
+        
+        # Don't return single jobs here - they should be handled as regular jobs
+        return None
+    
+    def _is_job_combination_feasible(self, jobs: List[JobInfo], plane_spec: Dict[str, Any], 
+                                   remaining_hours: float) -> bool:
+        """Check if a combination of jobs is feasible."""
+        if not jobs:
+            return False
+        
+        # All jobs must have the same first leg
+        first_leg = jobs[0].legs[0]
+        for job in jobs[1:]:
+            if (job.legs[0]['from_icao'] != first_leg['from_icao'] or 
+                job.legs[0]['to_icao'] != first_leg['to_icao']):
+                return False
+        
+        # Check total payload capacity
+        total_payload = sum(job.total_payload_lbs for job in jobs)
+        max_payload = self._calculate_payload_range_limit(plane_spec, first_leg['distance_nm'])
+        if total_payload > max_payload:
+            return False
+        
+        # Check time constraints
+        total_flight_hours = jobs[0].flight_hours  # All jobs share the same flight time
+        if total_flight_hours > remaining_hours:
+            return False
+        
+        # Check that all jobs can be delivered before work order completion
+        # This is handled by ensuring jobs are sorted by delivery waypoint
+        return True
+    
+    def _get_job_priority_score(self, job: JobInfo) -> float:
+        """Get priority score for a job (simplified version)."""
+        # Use balance score as default, but this could be customized based on plane priority
+        return job.balance_score
+    
+    def _get_job_chaining_potential(self, destination: str) -> int:
+        """Get the number of available jobs from a destination airport."""
+        # Direct database query (now using RAM database for speed)
+        with db_mod.connect(self.db_path) as conn:
+            # Count jobs from this destination that are not used
+            if not self._used_jobs_tracking:
+                count = conn.execute("""
+                    SELECT COUNT(DISTINCT jl.job_id)
+                    FROM job_legs jl
+                    WHERE jl.from_icao = ?
+                """, [destination]).fetchone()[0]
+            else:
+                count = conn.execute("""
+                    SELECT COUNT(DISTINCT jl.job_id)
+                    FROM job_legs jl
+                    WHERE jl.from_icao = ? 
+                    AND jl.job_id NOT IN ({})
+                """.format(','.join('?' * len(self._used_jobs_tracking))), 
+                [destination] + list(self._used_jobs_tracking)).fetchone()[0]
+            return count
+    
+    
+    def _calculate_payload_range_limit(self, plane_spec: Dict[str, Any], distance_nm: float) -> float:
+        """Calculate maximum payload for given distance (copied from score_jobs.py)."""
+        max_range = max(plane_spec["range1_nm"] or 0, plane_spec["range2_nm"] or 0)
+        max_payload = max(plane_spec["payload1_lbs"] or 0, plane_spec["payload2_lbs"] or 0)
+        
+        if distance_nm > max_range:
+            return 0
+        
+        if plane_spec["range1_nm"] == plane_spec["range2_nm"]:
+            return max_payload
+        
+        if plane_spec["payload1_lbs"] == plane_spec["payload2_lbs"]:
+            return plane_spec["payload1_lbs"]
+        
+        # Sort the range/payload pairs
+        if plane_spec["range1_nm"] > plane_spec["range2_nm"]:
+            r1, p1 = plane_spec["range2_nm"], plane_spec["payload2_lbs"]
+            r2, p2 = plane_spec["range1_nm"], plane_spec["payload1_lbs"]
+        else:
+            r1, p1 = plane_spec["range1_nm"], plane_spec["payload1_lbs"]
+            r2, p2 = plane_spec["range2_nm"], plane_spec["payload2_lbs"]
+        
+        if r1 == r2:
+            return max_payload if distance_nm <= r1 else 0
+        
+        if distance_nm <= r1:
+            return max(p1, p2)
+        elif distance_nm >= r2:
+            return min(p1, p2)
+        else:
+            m = (p2 - p1) / (r2 - r1)
+            calculated_payload = p1 + m * (distance_nm - r1)
+            return min(calculated_payload, max_payload)
+
     def generate_work_order(self, plane: PlaneInfo, max_hours: float = 24.0, 
                            epsilon_hours: float = 0.5) -> WorkOrder:
-        """Generate a work order for a single plane."""
+        """Generate a work order for a single plane with multi-job support."""
         work_order = WorkOrder(
             plane_id=plane.plane_id,
             plane_registration=plane.registration,
@@ -587,30 +1085,184 @@ class WorkOrderGenerator:
         
         current_location = plane.current_location
         remaining_hours = max_hours
-        hub_transit_added = False
+        max_transit_legs = 3  # Allow up to 3 transit legs to find better job chains
         
-        # First pass: greedy selection of best jobs
-        while remaining_hours > 0:
-            chainable_jobs = self.find_chainable_jobs(plane, current_location, remaining_hours, epsilon_hours)
+        # Get plane specifications for multi-job validation
+        plane_spec = self._get_plane_specs_for_plane(plane)
+        
+        # First pass: compare multi-job combinations vs single jobs and pick the most profitable
+        max_iterations = 12  # Allow more iterations for longer work orders with transit legs
+        iteration_count = 0
+        
+        while remaining_hours > 0.5 and iteration_count < max_iterations:  # Fill time more reasonably
+            # Find all available options
+            multi_job_legs = self.find_multi_job_combinations(plane, current_location, remaining_hours, plane_spec)
+            single_jobs = self.find_chainable_jobs(plane, current_location, remaining_hours, epsilon_hours)
             
-            # If no local jobs found and we haven't tried hub jobs yet, look for hub jobs
-            if not chainable_jobs and not hub_transit_added:
-                hub_jobs = self.find_jobs_from_major_hubs(plane, remaining_hours)
-                if hub_jobs:
-                    # Find the best hub job
-                    hub_jobs.sort(key=lambda j: work_order.get_priority_score(j), reverse=True)
-                    best_hub_job = None
-                    for job in hub_jobs:
-                        # Account for transit time to hub
-                        total_time = job.hub_penalty_hours + job.flight_hours
-                        if total_time <= (remaining_hours + epsilon_hours):
-                            best_hub_job = job
-                            break
+            # Filter options that fit within remaining time
+            feasible_multi_job_legs = [leg for leg in multi_job_legs if leg.flight_hours <= (remaining_hours + epsilon_hours)]
+            feasible_single_jobs = [job for job in single_jobs if work_order.can_add_job(job, max_hours, epsilon_hours)]
+            
+            # Find jobs from current location (most efficient approach)
+            jobs_from_current = [job for job in feasible_single_jobs 
+                               if job.legs and job.legs[0]['from_icao'].upper() == current_location.upper()]
+            
+            # Debug output for first few planes and BONE planes
+            if iteration_count == 0 and ('ANT' in plane.registration or 'BONE' in plane.registration or 'SKY' in plane.registration):
+                print(f"    DEBUG {plane.registration}: {len(multi_job_legs)} multi-job legs, {len(single_jobs)} single jobs available")
+                print(f"    DEBUG {plane.registration}: Jobs from current location: {len(jobs_from_current)}")
+                
+                # Debug multi-job leg creation
+                if len(multi_job_legs) == 0 and len(jobs_from_current) > 1:
+                    print(f"    DEBUG {plane.registration}: No multi-job legs despite {len(jobs_from_current)} jobs from {current_location}")
+                    # Show first few jobs and their legs
+                    for i, job in enumerate(jobs_from_current[:3]):
+                        if job.legs:
+                            leg_info = f"{job.legs[0]['from_icao']} -> {job.legs[0]['to_icao']}"
+                            print(f"    DEBUG {plane.registration}: Job {i+1}: {leg_info}, payload: {job.total_payload_lbs:.0f}lbs")
+                
+                if single_jobs:
+                    print(f"    DEBUG {plane.registration}: Best single job score: {work_order.get_priority_score(single_jobs[0]):.2f}")
+                if multi_job_legs:
+                    best_leg = max(multi_job_legs, key=lambda leg: sum(job.pay + job.xp for job in leg.jobs) / leg.flight_hours)
+                    print(f"    DEBUG {plane.registration}: Best multi-job leg: {len(best_leg.jobs)} jobs, {sum(job.pay + job.xp for job in best_leg.jobs) / best_leg.flight_hours:.2f} efficiency")
                     
-                    if best_hub_job:
+                    # Additional debug for BONE planes
+                    if 'BONE' in plane.registration:
+                        print(f"    DEBUG {plane.registration}: Current location: {current_location}")
+                        print(f"    DEBUG {plane.registration}: Remaining hours: {remaining_hours:.2f}")
+                        if jobs_from_current:
+                            first_job = jobs_from_current[0]
+                            print(f"    DEBUG {plane.registration}: First job flight hours: {first_job.flight_hours:.2f}")
+                            print(f"    DEBUG {plane.registration}: Job fits time: {first_job.flight_hours <= (remaining_hours + 0.5)}")
+                    
+                    # Additional debug for SKYLABS planes - focus on XP
+                    if 'SKY' in plane.registration:
+                        print(f"    DEBUG {plane.registration}: SKYLABS - Looking for high-XP jobs")
+                        best_leg_xp = sum(job.xp for job in best_leg.jobs)
+                        best_leg_pay = sum(job.pay for job in best_leg.jobs)
+                        print(f"    DEBUG {plane.registration}: Best multi-job leg XP: {best_leg_xp}, Pay: ${best_leg_pay:,.0f}")
+                        
+                        # Show top 5 multi-leg jobs by XP
+                        if multi_job_legs:
+                            print(f"    DEBUG {plane.registration}: Top 5 multi-leg jobs by XP:")
+                            sorted_multi = sorted(multi_job_legs, key=lambda x: sum(job.xp for job in x.jobs), reverse=True)[:5]
+                            for i, job in enumerate(sorted_multi, 1):
+                                job_xp = sum(j.xp for j in job.jobs)
+                                job_pay = sum(j.pay for j in job.jobs)
+                                print(f"      {i}. {len(job.jobs)} legs, {job_xp} XP, ${job_pay:,.0f} pay, {sum(j.pay + j.xp for j in job.jobs) / job.flight_hours:.2f} efficiency")
+                        
+                        # Show top 5 single jobs by XP
+                        if single_jobs:
+                            print(f"    DEBUG {plane.registration}: Top 5 single jobs by XP:")
+                            sorted_single = sorted(single_jobs, key=lambda x: x.xp, reverse=True)[:5]
+                            for i, job in enumerate(sorted_single, 1):
+                                print(f"      {i}. {job.xp} XP, ${job.pay:,.0f} pay, {work_order.get_priority_score(job):.2f} score")
+            
+            # Pure efficiency-first selection
+            best_option = None
+            best_efficiency_score = -1
+            best_type = None
+            
+            # 1. Check multi-job legs - highest efficiency potential
+            for leg in feasible_multi_job_legs:
+                # Score based purely on efficiency (pay+XP per hour)
+                total_value = sum(job.pay + job.xp for job in leg.jobs)
+                efficiency_score = total_value / leg.flight_hours if leg.flight_hours > 0 else 0
+                
+                # Bonus for multi-job combinations (they're more efficient)
+                if len(leg.jobs) > 1:
+                    efficiency_score *= 1.2
+                
+                if efficiency_score > best_efficiency_score:
+                    best_efficiency_score = efficiency_score
+                    best_option = leg
+                    best_type = "multi_job"
+            
+            # 2. Check local single jobs - highest efficiency from current location
+            for job in jobs_from_current:
+                # Use the plane's priority-based score (pay/XP/balanced per hour)
+                efficiency_score = work_order.get_priority_score(job)
+                
+                # Small bonus for jobs that lead to good chaining opportunities
+                chaining_potential = self._get_job_chaining_potential(job.destination)
+                if chaining_potential > 0:
+                    efficiency_score *= (1.0 + min(chaining_potential / 20.0, 0.2))  # Reduced to 20% bonus
+                
+                if efficiency_score > best_efficiency_score:
+                    best_efficiency_score = efficiency_score
+                    best_option = job
+                    best_type = "single_job"
+            
+            # Add the best option
+            if best_option and best_type == "multi_job":
+                # Add the multi-job leg
+                work_order.add_multi_job_leg(best_option)
+                
+                # Mark all jobs in this leg as used (in memory only)
+                for job in best_option.jobs:
+                    self._used_jobs_tracking.add(job.job_id)
+                
+                # Update location and remaining time
+                current_location = best_option.to_icao
+                remaining_hours = max_hours - work_order.total_hours
+                iteration_count += 1
+                continue
+            elif best_option and best_type == "single_job":
+                # Add the single job
+                work_order.add_job(best_option, work_order.total_hours)
+                self._used_jobs_tracking.add(best_option.job_id)
+                current_location = best_option.destination
+                remaining_hours = max_hours - work_order.total_hours
+                iteration_count += 1
+                continue
+            
+            # 3. If no local options found, consider ALL available jobs anywhere to build the most efficient work order
+            transit_legs_used = sum(1 for job in work_order.jobs if job.source == "transit")
+            if transit_legs_used < max_transit_legs:
+                # Get ALL feasible jobs from anywhere, not just major hubs
+                all_available_jobs = [job for job in plane.feasible_jobs if job.job_id not in self._used_jobs_tracking]
+                
+                # Debug output for planes having issues
+                if iteration_count == 0 and ('ANT' in plane.registration or 'BONE' in plane.registration):
+                    print(f"    DEBUG {plane.registration}: Available jobs anywhere: {len(all_available_jobs)}")
+                    print(f"    DEBUG {plane.registration}: Best local efficiency: {best_efficiency_score:.2f}")
+                
+                if all_available_jobs:
+                    # Find the best job from anywhere that helps build the most efficient work order
+                    best_remote_job = None
+                    best_remote_score = -1
+                    
+                    for job in all_available_jobs:
+                        # Skip jobs that don't start from current location (these need transit)
+                        if job.legs and job.legs[0]['from_icao'].upper() == current_location.upper():
+                            continue  # Already considered in local jobs
+                        
+                        # Calculate transit time to this job's starting location
+                        transit_time = self._calculate_hub_transit_time(plane, current_location, job.legs[0]['from_icao'])
+                        total_time = job.flight_hours + transit_time
+                        
+                        if total_time <= (remaining_hours + epsilon_hours):
+                            # Score based on overall efficiency including transit cost
+                            job_efficiency = work_order.get_priority_score(job)
+                            overall_efficiency = (job_efficiency * job.flight_hours) / total_time
+                            
+                            # Transit jobs naturally limit themselves through efficiency
+                            # Only consider if overall efficiency is positive and reasonable
+                            if overall_efficiency > best_remote_score and overall_efficiency > 0:
+                                best_remote_score = overall_efficiency
+                                best_remote_job = job
+                                best_remote_job.hub_penalty_hours = transit_time
+                    
+                    # Debug remote job selection
+                    if 'BONE' in plane.registration and best_remote_job:
+                        transit_efficiency = best_remote_job.flight_hours / (best_remote_job.flight_hours + best_remote_job.hub_penalty_hours)
+                        print(f"    DEBUG {plane.registration}: Remote job efficiency: {best_remote_score:.2f}, transit_eff={transit_efficiency:.3f}")
+                    
+                    if best_remote_job:
                         # Calculate actual distance for transit leg
                         transit_distance = self._calculate_distance_between_airports(
-                            current_location, best_hub_job.legs[0]['from_icao']
+                            current_location, best_remote_job.legs[0]['from_icao']
                         )
                         
                         # Calculate actual flight hours for transit leg using optimized speed if available
@@ -625,13 +1277,13 @@ class WorkOrderGenerator:
                         else:
                             transit_speed = self._get_base_speed(plane.plane_type)
                         
-                        transit_flight_hours = transit_distance / transit_speed if transit_speed > 0 else best_hub_job.hub_penalty_hours
+                        transit_flight_hours = transit_distance / transit_speed if transit_speed > 0 else best_remote_job.hub_penalty_hours
                         
-                        # Add transit time as a "virtual job" to account for flying to hub
+                        # Add transit time as a "virtual job" to account for flying to job location
                         transit_job = JobInfo(
-                            job_id=f"transit_{plane.plane_id}_{best_hub_job.legs[0]['from_icao']}",
+                            job_id=f"transit_{plane.plane_id}_{best_remote_job.legs[0]['from_icao']}",
                             departure=current_location,
-                            destination=best_hub_job.legs[0]['from_icao'],
+                            destination=best_remote_job.legs[0]['from_icao'],
                             pay=0.0,
                             xp=0.0,
                             distance_nm=transit_distance,
@@ -642,47 +1294,27 @@ class WorkOrderGenerator:
                             time_remaining_hours=999.0,  # Transit jobs don't expire
                             source="transit",
                             speed_kts=transit_speed,
-                            route=f"{current_location} -> {best_hub_job.legs[0]['from_icao']}",
+                            route=f"{current_location} -> {best_remote_job.legs[0]['from_icao']}",
                             legs_count=0,  # Transit legs don't count as actual job legs
                             legs=[]  # Empty legs for transit jobs
                         )
                         
                         work_order.add_job(transit_job, work_order.total_hours)
-                        current_location = best_hub_job.legs[0]['from_icao']
+                        current_location = best_remote_job.legs[0]['from_icao']
                         remaining_hours = max_hours - work_order.total_hours
-                        hub_transit_added = True
+                        iteration_count += 1
+                        # Continue to allow more transit legs if needed
                         continue
             
-            if not chainable_jobs:
-                break
-            
-            # Sort by priority score
-            chainable_jobs.sort(key=lambda j: work_order.get_priority_score(j), reverse=True)
-            
-            # Take the best job that fits
-            best_job = None
-            for job in chainable_jobs:
-                if work_order.can_add_job(job, max_hours, epsilon_hours):
-                    best_job = job
-                    break
-            
-            if not best_job:
-                break
-            
-            # Add job to work order
-            work_order.add_job(best_job, work_order.total_hours)
-            
-            # Mark job as used
-            self.used_jobs.add(best_job.job_id)
-            
-            # Update location and remaining time
-            current_location = best_job.destination
-            remaining_hours = max_hours - work_order.total_hours
+            # No more options available
+            if 'ANT' in plane.registration:
+                print(f"    DEBUG {plane.registration}: No more options found. Remaining hours: {remaining_hours:.2f}")
+            break
         
-        # Second pass: try to fill remaining time with smaller jobs
-        if remaining_hours > 0.1:  # Only if we have meaningful time left
-            self._optimize_work_order_second_pass(work_order, plane, current_location, 
-                                                 max_hours, epsilon_hours)
+        # Second pass: try to fill remaining time with smaller jobs (more aggressive)
+        if remaining_hours > 0.2:  # More aggressive about filling remaining time
+            self._optimize_work_order_second_pass_simple(work_order, plane, current_location, 
+                                                        max_hours, epsilon_hours)
         
         # Remove trailing transit legs (they provide no Pay/XP value)
         self._remove_trailing_transit_legs(work_order)
@@ -692,6 +1324,93 @@ class WorkOrderGenerator:
             self._optimize_job_order_for_penalties(work_order)
         
         return work_order
+    
+    def _get_airport_sizes(self, from_icao: str, to_icao: str) -> Tuple[int, int]:
+        """Get airport sizes for departure and destination airports with caching."""
+        # Check cache first
+        if from_icao not in self._airport_size_cache:
+            with db_mod.connect(self.db_path) as conn:
+                dep_row = conn.execute("SELECT size FROM airports WHERE icao = ?", (from_icao,)).fetchone()
+                self._airport_size_cache[from_icao] = int(dep_row[0]) if dep_row and dep_row[0] is not None else 3
+        
+        if to_icao not in self._airport_size_cache:
+            with db_mod.connect(self.db_path) as conn:
+                dest_row = conn.execute("SELECT size FROM airports WHERE icao = ?", (to_icao,)).fetchone()
+                self._airport_size_cache[to_icao] = int(dest_row[0]) if dest_row and dest_row[0] is not None else 3
+        
+        return self._airport_size_cache[from_icao], self._airport_size_cache[to_icao]
+    
+    def _get_plane_specs_for_plane(self, plane: PlaneInfo) -> Dict[str, Any]:
+        """Get plane specifications for a plane."""
+        # Direct database query (now using RAM database for speed)
+        with db_mod.connect(self.db_path) as conn:
+            # Get plane specs from the database
+            row = conn.execute("SELECT * FROM plane_specs WHERE plane_type = ?", (plane.plane_type,)).fetchone()
+            if row:
+                columns = [d[1] for d in conn.execute("PRAGMA table_info(plane_specs)").fetchall()]
+                spec_dict = dict(zip(columns, row))
+                return {
+                    "speed_kts": spec_dict.get("cruise_speed_kts") or 0,
+                    "min_airport_size": spec_dict.get("min_airport_size") or 0,
+                    "range1_nm": spec_dict.get("range1_nm") or 0,
+                    "payload1_lbs": spec_dict.get("payload1_lbs") or 0,
+                    "range2_nm": spec_dict.get("range2_nm") or 0,
+                    "payload2_lbs": spec_dict.get("payload2_lbs") or 0,
+                    "priority": spec_dict.get("priority") or "balance"
+                }
+            else:
+                # Fallback to default values
+                return {
+                    "speed_kts": 200.0,
+                    "min_airport_size": 0,
+                    "range1_nm": 1000.0,
+                    "payload1_lbs": 1000.0,
+                    "range2_nm": 1000.0,
+                    "payload2_lbs": 1000.0,
+                    "priority": "balance"
+                }
+    
+    def _optimize_work_order_second_pass_simple(self, work_order: WorkOrder, plane: PlaneInfo,
+                                              current_location: str, max_hours: float, 
+                                              epsilon_hours: float) -> None:
+        """Improved second pass optimization to better fill work orders."""
+        remaining_hours = max_hours - work_order.total_hours
+        
+        # Try to add jobs if there's time remaining and good efficiency options
+        max_attempts = 3 if remaining_hours > 4.0 else 1  # Fewer attempts, focus on efficiency
+        
+        for attempt in range(max_attempts):
+            if remaining_hours < 0.5:  # Stop if less than 30 minutes left (reasonable threshold)
+                break
+                
+            chainable_jobs = self.find_chainable_jobs(plane, current_location, remaining_hours, epsilon_hours)
+            
+            if not chainable_jobs:
+                break
+            
+            # Find the best job that fits in remaining time
+            best_job = None
+            best_score = -1
+            
+            for job in chainable_jobs:
+                if job.flight_hours <= (remaining_hours + epsilon_hours):
+                    # Score based purely on efficiency (plane's priority)
+                    score = work_order.get_priority_score(job)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_job = job
+            
+            if best_job:
+                # Add the job
+                work_order.add_job(best_job, work_order.total_hours)
+                self._used_jobs_tracking.add(best_job.job_id)
+                
+                # Update for next iteration
+                current_location = best_job.destination
+                remaining_hours = max_hours - work_order.total_hours
+            else:
+                break
     
     def _remove_trailing_transit_legs(self, work_order: WorkOrder) -> None:
         """Remove trailing transit legs from work order since they provide no Pay/XP value."""
@@ -738,7 +1457,7 @@ class WorkOrderGenerator:
             
             # Add the job
             work_order.add_job(best_job, work_order.total_hours)
-            self.used_jobs.add(best_job.job_id)
+            self._used_jobs_tracking.add(best_job.job_id)
             
             # Update for next iteration
             current_location = best_job.destination
@@ -828,6 +1547,14 @@ class WorkOrderGenerator:
             work_order.total_pay += job.pay
             work_order.total_xp += job.xp
             work_order.total_adjusted_pay += job.adjusted_pay_total
+        
+        # Also include multi-job legs in totals
+        for leg in work_order.multi_job_legs:
+            work_order.total_hours += leg.flight_hours
+            for job in leg.jobs:
+                work_order.total_pay += job.pay
+                work_order.total_xp += job.xp
+                work_order.total_adjusted_pay += job.adjusted_pay_total
     
     def generate_all_work_orders(self, max_hours: float = 24.0, 
                                 epsilon_hours: float = 0.5) -> List[WorkOrder]:
@@ -837,11 +1564,61 @@ class WorkOrderGenerator:
         
         print(f"Found {len(idle_planes)} idle planes")
         
+        # Sort planes by efficiency within priority groups: Pay → XP → Balanced
+        # This ensures the most efficient planes get first access to the best jobs
+        def plane_efficiency_key(plane):
+            # Priority order: Pay planes first, then XP, then Balanced
+            priority_order = {'pay': 0, 'xp': 1, 'balance': 2}
+            priority_score = priority_order.get(plane.priority, 3)
+            
+            # Within each priority group, sort by plane efficiency
+            # Higher efficiency planes (better pay/XP per hour) should go first
+            efficiency_scores = {
+                'Antonov AN-225-210': 1000,  # Highest pay efficiency
+                'Lockheed SR-71': 900,       # High XP efficiency
+                'Concorde': 800,             # Good XP efficiency
+                'Rockwell B-1 Lancer': 700,  # Good XP efficiency
+                'Cargo 400M': 600,           # Moderate efficiency
+                'Cessna Longitude': 500,     # Lower efficiency
+                'Hercules H-4': 400,         # Lower efficiency
+                'VSKYLABS Skyscenders 76': 300  # Lower efficiency
+            }
+            
+            # Sort by priority first, then by efficiency (descending)
+            return (priority_score, -efficiency_scores.get(plane.plane_type, 100))
+        
+        idle_planes.sort(key=plane_efficiency_key)
+        
         for i, plane in enumerate(idle_planes, 1):
             print(f"Processing plane {i}/{len(idle_planes)}: {plane.registration} ({plane.plane_type}, priority: {plane.priority})")
             
             # Load feasible jobs for this plane
             self.load_feasible_jobs_for_plane(plane)
+            
+            # Debug for Concorde and Lancer planes
+            if plane.plane_type in ['Concorde', 'Rockwell B-1 Lancer']:
+                print(f"  DEBUG {plane.registration}: Total feasible jobs: {len(plane.feasible_jobs)}")
+                if plane.feasible_jobs:
+                    # Show first few jobs and their locations
+                    for j, job in enumerate(plane.feasible_jobs[:3]):
+                        if job.legs:
+                            leg_info = f"{job.legs[0]['from_icao']} -> {job.destination}"
+                            print(f"  DEBUG {plane.registration}: Job {j+1}: {leg_info}, pay: ${job.pay:,.0f}, hours: {job.flight_hours:.1f}h")
+                else:
+                    print(f"  DEBUG {plane.registration}: No feasible jobs found - checking why...")
+                    # Check if there are ANY jobs in the database for this plane type
+                    with db_mod.connect(self.db_path) as conn:
+                        total_jobs = conn.execute("""
+                            SELECT COUNT(*) FROM job_scores js 
+                            JOIN jobs j ON j.id = js.job_id 
+                            WHERE js.plane_id = ?
+                        """, (plane.plane_id,)).fetchone()
+                        feasible_jobs = conn.execute("""
+                            SELECT COUNT(*) FROM job_scores js 
+                            JOIN jobs j ON j.id = js.job_id 
+                            WHERE js.plane_id = ? AND js.feasible = 1
+                        """, (plane.plane_id,)).fetchone()
+                        print(f"  DEBUG {plane.registration}: Total jobs scored: {total_jobs[0]}, Feasible: {feasible_jobs[0]}")
             
             if not plane.feasible_jobs:
                 print(f"  No feasible jobs found for {plane.registration}")
@@ -852,31 +1629,63 @@ class WorkOrderGenerator:
             # Generate work order
             work_order = self.generate_work_order(plane, max_hours, epsilon_hours)
             
+            # Check if work order has any profitable jobs (regular jobs or multi-job legs)
+            total_jobs = len(work_order.jobs) + sum(len(leg.jobs) for leg in work_order.multi_job_legs)
+            
+            # Filter out work orders that only contain transit jobs or end with transit jobs
+            has_profitable_jobs = False
             if work_order.jobs:
+                # Check if any regular job has pay or XP
+                has_profitable_jobs = any(job.pay > 0 or job.xp > 0 for job in work_order.jobs)
+            if work_order.multi_job_legs:
+                # Check if any multi-job leg has pay or XP
+                has_profitable_jobs = has_profitable_jobs or any(
+                    any(job.pay > 0 or job.xp > 0 for job in leg.jobs) 
+                    for leg in work_order.multi_job_legs
+                )
+            
+            # Also check that the work order doesn't end with a transit job
+            ends_with_transit = False
+            if work_order.jobs and work_order.jobs[-1].source == "transit":
+                ends_with_transit = True
+            
+            if total_jobs > 0 and has_profitable_jobs and not ends_with_transit:
                 work_orders.append(work_order)
-                print(f"  Generated work order with {len(work_order.jobs)} jobs, {work_order.total_hours:.2f} hours")
+                print(f"  Generated work order with {total_jobs} jobs ({len(work_order.jobs)} regular, {len(work_order.multi_job_legs)} multi-job legs), {work_order.total_hours:.2f} hours")
             else:
-                print(f"  No suitable job chain found for {plane.registration}")
-                # Debug: Check what happened for PANO planes
-                if 'PANO' in plane.registration:
+                if total_jobs == 0:
+                    print(f"  No suitable job chain found for {plane.registration}")
+                elif not has_profitable_jobs:
+                    print(f"  No profitable jobs found for {plane.registration} (only transit jobs)")
+                elif ends_with_transit:
+                    print(f"  Work order ends with transit job for {plane.registration} (rejected)")
+                # Debug: Check what happened for PANO and BONE planes
+                if 'PANO' in plane.registration or 'BONE' in plane.registration:
                     print(f"    DEBUG: {plane.registration} - Feasible jobs: {len(plane.feasible_jobs)}")
-                    print(f"    DEBUG: {plane.registration} - Used jobs count: {len(self.used_jobs)}")
+                    print(f"    DEBUG: {plane.registration} - Used jobs count: {len(self._used_jobs_tracking)}")
                     if plane.feasible_jobs:
-                        available_jobs = [job for job in plane.feasible_jobs if job.job_id not in self.used_jobs]
+                        available_jobs = [job for job in plane.feasible_jobs if job.job_id not in self._used_jobs_tracking]
                         print(f"    DEBUG: {plane.registration} - Available jobs: {len(available_jobs)}")
                         if available_jobs:
                             print(f"    DEBUG: {plane.registration} - First available job: {available_jobs[0].job_id}")
-                            # Check if this job can be chained
-                            chainable = self.find_chainable_jobs(plane, plane.current_location, max_hours, epsilon_hours)
-                            print(f"    DEBUG: {plane.registration} - Chainable jobs: {len(chainable)}")
-                            if chainable:
-                                print(f"    DEBUG: {plane.registration} - Chainable job: {chainable[0].job_id}")
-                            else:
-                                print(f"    DEBUG: {plane.registration} - No chainable jobs found")
+                            
+                        # Debug work order details
+                        print(f"    DEBUG: {plane.registration} - Work order jobs: {len(work_order.jobs)}")
+                        print(f"    DEBUG: {plane.registration} - Work order multi-job legs: {len(work_order.multi_job_legs)}")
+                        if work_order.jobs:
+                            print(f"    DEBUG: {plane.registration} - Work order total hours: {work_order.total_hours:.2f}")
+                            print(f"    DEBUG: {plane.registration} - Has profitable jobs: {has_profitable_jobs}")
+                            print(f"    DEBUG: {plane.registration} - Ends with transit: {ends_with_transit}")
+                            if work_order.jobs:
+                                last_job = work_order.jobs[-1]
+                                print(f"    DEBUG: {plane.registration} - Last job source: {last_job.source}, pay: {last_job.pay}, xp: {last_job.xp}")
                         else:
                             print(f"    DEBUG: {plane.registration} - All jobs already used")
                     else:
                         print(f"    DEBUG: {plane.registration} - No feasible jobs")
+        
+        # Write used jobs to database only once at the end
+        self.write_used_jobs_to_database()
         
         return work_orders
 
@@ -900,20 +1709,49 @@ def print_work_orders(work_orders: List[WorkOrder]) -> None:
         print(f"Total XP: {wo.total_xp:,.0f}")
         print(f"Jobs: {len(wo.jobs)}")
         
-        if wo.jobs:
+        if wo.jobs or wo.multi_job_legs:
             print("\nJob Sequence:")
             accumulated_hours = 0.0
+            job_counter = 1
             
-            for j, job in enumerate(wo.jobs, 1):
+            # Print regular jobs first
+            for job in wo.jobs:
                 accumulated_hours += job.flight_hours
                 late_indicator = f" [LATE {accumulated_hours - job.time_remaining_hours:.1f}h]" if accumulated_hours > job.time_remaining_hours else ""
                 penalty_str = f" penalty=${job.penalty_amount:.0f}" if job.penalty_amount > 0 else ""
                 
-                print(f"  {j}. {job.departure} -> {job.destination}")
+                print(f"  {job_counter}. {job.departure} -> {job.destination}")
                 print(f"     Job: {job.job_id}")
                 print(f"     Distance: {job.distance_nm:.0f}nm, Time: {job.flight_hours:.2f}h")
                 print(f"     Pay: ${job.pay:,.0f}/hr -> ${job.pay_per_hour:.0f}, XP: {job.xp_per_hour:.0f}/hr")
                 print(f"     Time Remaining: {job.time_remaining_hours:.1f}h{late_indicator}{penalty_str}")
+                job_counter += 1
+            
+            # Print multi-job legs
+            for leg in wo.multi_job_legs:
+                accumulated_hours += leg.flight_hours
+                
+                # Calculate combined metrics for the leg
+                total_pay = sum(job.pay for job in leg.jobs)
+                total_xp = sum(job.xp for job in leg.jobs)
+                combined_pay_per_hour = total_pay / leg.flight_hours if leg.flight_hours > 0 else 0
+                combined_xp_per_hour = total_xp / leg.flight_hours if leg.flight_hours > 0 else 0
+                
+                print(f"  {job_counter}. {leg.from_icao} -> {leg.to_icao} (MULTI-JOB LEG)")
+                print(f"     Distance: {leg.distance_nm:.0f}nm, Time: {leg.flight_hours:.2f}h, Speed: {leg.speed_kts:.0f}kts")
+                print(f"     Total Payload: {leg.total_payload_lbs:.0f}lbs")
+                print(f"     Combined: ${total_pay:,.0f} total pay, {total_xp:,.0f} total XP")
+                print(f"     Combined: ${combined_pay_per_hour:.0f}/hr, {combined_xp_per_hour:.0f} XP/hr")
+                print(f"     Jobs ({len(leg.jobs)}):")
+                
+                for i, job in enumerate(leg.jobs, 1):
+                    late_indicator = f" [LATE {accumulated_hours - job.time_remaining_hours:.1f}h]" if accumulated_hours > job.time_remaining_hours else ""
+                    penalty_str = f" penalty=${job.penalty_amount:.0f}" if job.penalty_amount > 0 else ""
+                    
+                    print(f"       {i}. {job.job_id} - Pay: ${job.pay:,.0f}, XP: {job.xp:,.0f}")
+                    print(f"          Payload: {job.total_payload_lbs:.0f}lbs, Time Remaining: {job.time_remaining_hours:.1f}h{late_indicator}{penalty_str}")
+                
+                job_counter += 1
         
         print(f"\n{'-'*60}")
 
@@ -969,38 +1807,64 @@ def main():
 
 
 def export_to_csv(work_orders: List[WorkOrder], csv_path: str) -> None:
-    """Export work orders to CSV."""
+    """Export work orders to CSV with optimized disk writes."""
     import csv
     
-    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
+    # Prepare all data in memory first to minimize disk writes
+    all_rows = []
+    
+    # Header
+    header = [
+        'work_order_id', 'plane_id', 'plane_registration', 'plane_type', 'priority',
+        'job_sequence', 'job_id', 'source', 'departure', 'destination', 'distance_nm',
+        'flight_hours', 'pay', 'xp', 'pay_per_hour', 'xp_per_hour', 'balance_score',
+        'time_remaining_hours', 'penalty_amount', 'adjusted_pay_per_hour', 'adjusted_pay_total',
+        'speed_kts', 'min_airport_size', 'route', 'legs_count',
+        'accumulated_hours', 'is_late', 'job_type', 'payload_lbs'
+    ]
+    all_rows.append(header)
+    
+    # Data
+    for wo_id, wo in enumerate(work_orders, 1):
+        accumulated_hours = 0.0
+        job_seq = 1
         
-        # Header
-        writer.writerow([
-            'work_order_id', 'plane_id', 'plane_registration', 'plane_type', 'priority',
-            'job_sequence', 'job_id', 'source', 'departure', 'destination', 'distance_nm',
-            'flight_hours', 'pay', 'xp', 'pay_per_hour', 'xp_per_hour', 'balance_score',
-            'time_remaining_hours', 'penalty_amount', 'adjusted_pay_per_hour', 'adjusted_pay_total',
-            'speed_kts', 'min_airport_size', 'route', 'legs_count',
-            'accumulated_hours', 'is_late'
-        ])
-        
-        # Data
-        for wo_id, wo in enumerate(work_orders, 1):
-            accumulated_hours = 0.0
+        # Export regular jobs
+        for job in wo.jobs:
+            accumulated_hours += job.flight_hours
+            is_late = accumulated_hours > job.time_remaining_hours
             
-            for job_seq, job in enumerate(wo.jobs, 1):
-                accumulated_hours += job.flight_hours
+            all_rows.append([
+                wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
+                job_seq, job.job_id, job.source, job.departure, job.destination, job.distance_nm,
+                job.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
+                job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
+                job.speed_kts, job.min_airport_size or "", job.route, job.legs_count,
+                accumulated_hours, is_late, "single", job.total_payload_lbs
+            ])
+            job_seq += 1
+        
+        # Export multi-job legs
+        for leg in wo.multi_job_legs:
+            accumulated_hours += leg.flight_hours
+            
+            for i, job in enumerate(leg.jobs, 1):
                 is_late = accumulated_hours > job.time_remaining_hours
                 
-                writer.writerow([
+                all_rows.append([
                     wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
-                    job_seq, job.job_id, job.source, job.departure, job.destination, job.distance_nm,
-                    job.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
+                    job_seq, job.job_id, job.source, leg.from_icao, leg.to_icao, leg.distance_nm,
+                    leg.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
                     job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
-                    job.speed_kts, job.min_airport_size or "", job.route, job.legs_count,
-                    accumulated_hours, is_late
+                    leg.speed_kts, job.min_airport_size or "", f"{leg.from_icao} -> {leg.to_icao}", job.legs_count,
+                    accumulated_hours, is_late, f"multi_{i}/{len(leg.jobs)}", job.total_payload_lbs
                 ])
+            job_seq += 1
+    
+    # Write all data in a single operation
+    with open(csv_path, 'w', newline='', encoding='utf-8', buffering=8192) as f:
+        writer = csv.writer(f)
+        writer.writerows(all_rows)
 
 
 if __name__ == "__main__":

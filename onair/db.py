@@ -102,6 +102,10 @@ def connect(db_path: str):
 		conn.execute("PRAGMA journal_mode=WAL")
 		conn.execute("PRAGMA synchronous=NORMAL")
 		conn.execute("PRAGMA temp_store=MEMORY")
+		# Additional optimizations for reduced disk writes
+		conn.execute("PRAGMA cache_size=10000")  # 10MB cache
+		conn.execute("PRAGMA page_size=4096")    # Larger page size for better I/O
+		conn.execute("PRAGMA mmap_size=268435456")  # 256MB memory mapping
 		yield conn
 	finally:
 		conn.close()
@@ -193,6 +197,7 @@ def upsert_jobs(db_path: str, jobs: Iterable[Dict[str, Any]], *, source: str) ->
 	fetched_at = datetime.now(timezone.utc).isoformat()
 	with connect(db_path) as conn:
 		cursor = conn.cursor()
+		job_data = []
 		for job in jobs:
 			job_id = _safe_get(job, "Id") or _safe_get(job, "id") or _safe_get(job, "JobId")
 			if not job_id:
@@ -204,37 +209,40 @@ def upsert_jobs(db_path: str, jobs: Iterable[Dict[str, Any]], *, source: str) ->
 			xp = _safe_get(job, "XP") or _safe_get(job, "xp")
 			expires_at = _safe_get(job, "Expiration") or _safe_get(job, "expiration") or _safe_get(job, "ExpiresAt")
 
-			cursor.execute(
-				"""
-				INSERT INTO jobs (id, source, departure, destination, cargo_weight, pay, xp, expires_at, computed_distance_nm, data_json, fetched_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT computed_distance_nm FROM jobs WHERE id=?), NULL), ?, ?)
-				ON CONFLICT(id) DO UPDATE SET
-					source=excluded.source,
-					departure=excluded.departure,
-					destination=excluded.destination,
-					cargo_weight=excluded.cargo_weight,
-					pay=excluded.pay,
-					xp=excluded.xp,
-					expires_at=excluded.expires_at,
-					data_json=excluded.data_json,
-					fetched_at=excluded.fetched_at
-				""",
-				(
-					job_id,
-					source,
-					departure,
-					destination,
-					float(cargo_weight) if isinstance(cargo_weight, (int, float)) else None,
-					float(pay) if isinstance(pay, (int, float)) else None,
-					float(xp) if isinstance(xp, (int, float)) else None,
-					str(expires_at) if expires_at is not None else None,
-					job_id,
-					json.dumps(job, ensure_ascii=False),
-					fetched_at,
-				),
-			)
+			job_data.append((
+				job_id,
+				source,
+				departure,
+				destination,
+				float(cargo_weight) if isinstance(cargo_weight, (int, float)) else None,
+				float(pay) if isinstance(pay, (int, float)) else None,
+				float(xp) if isinstance(xp, (int, float)) else None,
+				str(expires_at) if expires_at is not None else None,
+				job_id,
+				json.dumps(job, ensure_ascii=False),
+				fetched_at,
+			))
 			rows += 1
-			conn.commit()
+		
+		# Batch insert/update all jobs in a single transaction
+		cursor.executemany(
+			"""
+			INSERT INTO jobs (id, source, departure, destination, cargo_weight, pay, xp, expires_at, computed_distance_nm, data_json, fetched_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT computed_distance_nm FROM jobs WHERE id=?), NULL), ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				source=excluded.source,
+				departure=excluded.departure,
+				destination=excluded.destination,
+				cargo_weight=excluded.cargo_weight,
+				pay=excluded.pay,
+				xp=excluded.xp,
+				expires_at=excluded.expires_at,
+				data_json=excluded.data_json,
+				fetched_at=excluded.fetched_at
+			""",
+			job_data
+		)
+		conn.commit()
 	return rows
 
 
@@ -310,6 +318,7 @@ def upsert_airplanes(db_path: str, airplanes: Iterable[Dict[str, Any]]) -> int:
 	updated_at = datetime.now(timezone.utc).isoformat()
 	with connect(db_path) as conn:
 		cur = conn.cursor()
+		airplane_data = []
 		for ap in airplanes:
 			ap_id = _safe_get(ap, "Id") or _safe_get(ap, "id")
 			reg = _safe_get(ap, "Registration") or _safe_get(ap, "TailNumber") or _safe_get(ap, "Ident") or _safe_get(ap, "Identifier") or _safe_get(ap, "registration")
@@ -335,44 +344,47 @@ def upsert_airplanes(db_path: str, airplanes: Iterable[Dict[str, Any]]) -> int:
 			payload_cap = _safe_get(ap, "MaxPayload") or _safe_get(ap, "payload_capacity")
 			seats = _safe_get(ap, "Seats") or _safe_get(ap, "seats")
 
-			cur.execute(
-				"""
-				INSERT INTO airplanes (id, registration, type, model, icao, status, location_icao, latitude, longitude, fuel_total, payload_capacity, seats, updated_at, data_json)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-				ON CONFLICT(id) DO UPDATE SET
-					registration=excluded.registration,
-					type=excluded.type,
-					model=excluded.model,
-					icao=excluded.icao,
-					status=excluded.status,
-					location_icao=excluded.location_icao,
-					latitude=excluded.latitude,
-					longitude=excluded.longitude,
-					fuel_total=excluded.fuel_total,
-					payload_capacity=excluded.payload_capacity,
-					seats=excluded.seats,
-					updated_at=excluded.updated_at,
-					data_json=excluded.data_json
-				""",
-				(
-					ap_id,
-					reg,
-					type_name,
-					model,
-					aircraft_icao,
-					status,
-					loc,
-					float(lat) if isinstance(lat, (int, float)) else None,
-					float(lon) if isinstance(lon, (int, float)) else None,
-					float(fuel_total) if isinstance(fuel_total, (int, float)) else None,
-					float(payload_cap) if isinstance(payload_cap, (int, float)) else None,
-					int(seats) if isinstance(seats, (int, float)) else None,
-					updated_at,
-					json.dumps(ap, ensure_ascii=False),
-				),
-			)
+			airplane_data.append((
+				ap_id,
+				reg,
+				type_name,
+				model,
+				aircraft_icao,
+				status,
+				loc,
+				float(lat) if isinstance(lat, (int, float)) else None,
+				float(lon) if isinstance(lon, (int, float)) else None,
+				float(fuel_total) if isinstance(fuel_total, (int, float)) else None,
+				float(payload_cap) if isinstance(payload_cap, (int, float)) else None,
+				int(seats) if isinstance(seats, (int, float)) else None,
+				updated_at,
+				json.dumps(ap, ensure_ascii=False),
+			))
 			rows += 1
-			conn.commit()
+		
+		# Batch insert/update all airplanes in a single transaction
+		cur.executemany(
+			"""
+			INSERT INTO airplanes (id, registration, type, model, icao, status, location_icao, latitude, longitude, fuel_total, payload_capacity, seats, updated_at, data_json)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				registration=excluded.registration,
+				type=excluded.type,
+				model=excluded.model,
+				icao=excluded.icao,
+				status=excluded.status,
+				location_icao=excluded.location_icao,
+				latitude=excluded.latitude,
+				longitude=excluded.longitude,
+				fuel_total=excluded.fuel_total,
+				payload_capacity=excluded.payload_capacity,
+				seats=excluded.seats,
+				updated_at=excluded.updated_at,
+				data_json=excluded.data_json
+			""",
+			airplane_data
+		)
+		conn.commit()
 	return rows
 
 
@@ -403,9 +415,41 @@ def upsert_job_leg(db_path: str, job_id: str, leg_index: int, from_icao: str, to
 		conn.commit()
 
 
+def upsert_job_legs_bulk(db_path: str, legs: Iterable[Tuple[str, int, str, str, float, float, float, float, float, Optional[float]]]) -> None:
+	"""Insert or update many job legs in a single transaction."""
+	with connect(db_path) as conn:
+		conn.executemany(
+			"""
+			INSERT INTO job_legs (job_id, leg_index, from_icao, to_icao, from_lat, from_lon, to_lat, to_lon, distance_nm, cargo_lbs)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(job_id, leg_index) DO UPDATE SET
+				from_icao=excluded.from_icao,
+				to_icao=excluded.to_icao,
+				from_lat=excluded.from_lat,
+				from_lon=excluded.from_lon,
+				to_lat=excluded.to_lat,
+				to_lon=excluded.to_lon,
+				distance_nm=excluded.distance_nm,
+				cargo_lbs=excluded.cargo_lbs
+			""",
+			list(legs),
+		)
+		conn.commit()
+
+
 def update_job_total_distance(db_path: str, job_id: str, total_nm: float) -> None:
 	with connect(db_path) as conn:
 		conn.execute("UPDATE jobs SET computed_distance_nm = ? WHERE id = ?", (total_nm, job_id))
+		conn.commit()
+
+
+def update_job_total_distances_bulk(db_path: str, distances: Iterable[Tuple[float, str]]) -> None:
+	"""Update many job total distances in a single transaction."""
+	with connect(db_path) as conn:
+		conn.executemany(
+			"UPDATE jobs SET computed_distance_nm = ? WHERE id = ?",
+			list(distances)
+		)
 		conn.commit()
 
 
