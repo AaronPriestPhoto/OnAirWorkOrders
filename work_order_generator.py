@@ -157,6 +157,7 @@ class WorkOrder:
     priority: str
     jobs: List[JobInfo] = field(default_factory=list)
     multi_job_legs: List[MultiJobLeg] = field(default_factory=list)  # New: legs that can carry multiple jobs
+    execution_order: List[Tuple[str, Any]] = field(default_factory=list)  # Track execution order: ("job", job) or ("multi_leg", leg)
     total_hours: float = 0.0
     total_pay: float = 0.0
     total_xp: float = 0.0
@@ -170,6 +171,7 @@ class WorkOrder:
         job.adjusted_pay_per_hour = job.adjusted_pay_total / job.flight_hours if job.flight_hours > 0 else 0.0
         
         self.jobs.append(job)
+        self.execution_order.append(("job", job))  # Track execution order
         self.total_hours += job.flight_hours
         self.total_pay += job.pay
         self.total_xp += job.xp
@@ -187,7 +189,12 @@ class WorkOrder:
     
     def get_current_location(self) -> str:
         """Get the current location after all jobs in the work order."""
-        return self.jobs[-1].destination if self.jobs else ""
+        # Check multi-job legs first (they come after regular jobs)
+        if self.multi_job_legs:
+            return self.multi_job_legs[-1].to_icao
+        elif self.jobs:
+            return self.jobs[-1].destination
+        return ""
     
     def can_add_job(self, job: JobInfo, max_hours: float, epsilon_hours: float = 0.5) -> bool:
         """Check if a job can be added within time constraints."""
@@ -207,6 +214,7 @@ class WorkOrder:
     def add_multi_job_leg(self, leg: MultiJobLeg) -> None:
         """Add a multi-job leg to the work order."""
         self.multi_job_legs.append(leg)
+        self.execution_order.append(("multi_leg", leg))  # Track execution order
         
         # Recalculate job metrics for multi-job legs
         self._recalculate_multi_job_leg_metrics(leg)
@@ -841,7 +849,7 @@ class WorkOrderGenerator:
     
     def find_multi_job_combinations(self, plane: PlaneInfo, current_location: str, 
                                    remaining_hours: float, plane_spec: Dict[str, Any]) -> List[MultiJobLeg]:
-        """Find optimal combinations of chained jobs that can be carried together."""
+        """Find optimal combinations of jobs that share the same origin and destination."""
         # Get all feasible jobs from anywhere (not just current location)
         available_jobs = [job for job in plane.feasible_jobs 
                          if job.job_id not in self._used_jobs_tracking and job.legs]
@@ -851,62 +859,104 @@ class WorkOrderGenerator:
         
         multi_job_legs = []
         
-        # Find chained job combinations
-        # Look for jobs that start from current location and can chain to other jobs
-        starting_jobs = [job for job in available_jobs 
-                        if job.legs[0]['from_icao'].upper() == current_location.upper()]
+        # Group jobs by origin-destination pairs
+        route_groups = defaultdict(list)
+        for job in available_jobs:
+            # Only consider single-leg jobs for multi-job legs (simpler logic)
+            if len(job.legs) == 1:
+                leg = job.legs[0]
+                route_key = (leg['from_icao'].upper(), leg['to_icao'].upper())
+                route_groups[route_key].append(job)
         
-        for start_job in starting_jobs:
-            # Find jobs that start where this job ends
-            start_destination = start_job.destination.upper()
-            chained_jobs = [job for job in available_jobs 
-                           if job.job_id != start_job.job_id and 
-                           job.legs[0]['from_icao'].upper() == start_destination]
-            
-            if chained_jobs:
-                # Try to find the best combination of start_job + chained_job(s)
-                best_combination = self._find_chained_job_combination(
-                    start_job, chained_jobs, plane_spec, remaining_hours
-                )
+        # Create multi-job legs for routes with multiple jobs
+        for (from_icao, to_icao), jobs in route_groups.items():
+            if len(jobs) > 1:
+                # Calculate distance for this route
+                distance = jobs[0].legs[0]['distance_nm']
+                
+                # Find the best combination of jobs for this route
+                best_combination = self._find_best_job_combination(jobs, plane_spec, distance, remaining_hours)
                 
                 if best_combination and len(best_combination) > 1:
-                    # Create a multi-job leg for this chained combination
-                    multi_leg = self._create_chained_multi_job_leg(best_combination)
+                    # Create a multi-job leg for this combination
+                    multi_leg = self._create_simple_multi_job_leg(best_combination, from_icao, to_icao, distance)
                     if multi_leg:
                         multi_job_legs.append(multi_leg)
         
         return multi_job_legs
     
-    def _find_chained_job_combination(self, start_job: JobInfo, chained_jobs: List[JobInfo], 
-                                    plane_spec: Dict[str, Any], remaining_hours: float) -> Optional[List[JobInfo]]:
-        """Find the best combination of a start job with chained jobs."""
-        if not chained_jobs:
+    def _find_best_job_combination(self, jobs: List[JobInfo], plane_spec: Dict[str, Any], 
+                                  distance: float, remaining_hours: float) -> Optional[List[JobInfo]]:
+        """Find the best combination of jobs for the same route that fits within plane limits."""
+        if len(jobs) < 2:
             return None
         
-        # Calculate total time for start job
-        start_time = start_job.flight_hours
-        if start_time > remaining_hours:
-            return None
+        # Sort jobs by efficiency (pay + xp per hour) to try most profitable first
+        sorted_jobs = sorted(jobs, key=lambda job: (job.pay + job.xp) / job.flight_hours, reverse=True)
         
-        # Find the best chained job that fits within remaining time
-        best_chained_job = None
-        best_efficiency = -1
+        best_combination = []
+        best_profit = 0
+        total_payload = 0
+        total_time = 0
         
-        for chained_job in chained_jobs:
-            total_time = start_time + chained_job.flight_hours
-            if total_time <= remaining_hours:
-                # Calculate combined efficiency
-                total_pay = start_job.pay + chained_job.pay
-                total_xp = start_job.xp + chained_job.xp
-                combined_efficiency = (total_pay + total_xp) / total_time
-                
-                if combined_efficiency > best_efficiency:
-                    best_efficiency = combined_efficiency
-                    best_chained_job = chained_job
+        # Try adding jobs one by one, starting with the most efficient
+        for job in sorted_jobs:
+            # Check if adding this job would exceed limits
+            new_total_payload = total_payload + job.total_payload_lbs
+            new_total_time = total_time + job.flight_hours
+            
+            # Check payload capacity for this distance
+            max_payload = self._calculate_payload_range_limit(plane_spec, distance)
+            if new_total_payload > max_payload:
+                continue  # Skip this job - would exceed payload capacity
+            
+            # Check time limits
+            if new_total_time > remaining_hours:
+                continue  # Skip this job - would exceed time limit
+            
+            # Add this job to the combination
+            best_combination.append(job)
+            total_payload = new_total_payload
+            total_time = new_total_time
+            best_profit += job.pay + job.xp
         
-        if best_chained_job:
-            return [start_job, best_chained_job]
+        # Return the combination if it has multiple jobs and is profitable
+        if len(best_combination) > 1 and best_profit > 0:
+            return best_combination
+        
         return None
+    
+    def _create_simple_multi_job_leg(self, jobs: List[JobInfo], from_icao: str, to_icao: str, 
+                                   distance: float) -> Optional[MultiJobLeg]:
+        """Create a multi-job leg from jobs that share the same origin and destination."""
+        if len(jobs) < 2:
+            return None
+        
+        # Calculate total payload and flight time
+        total_payload = sum(job.total_payload_lbs for job in jobs)
+        total_pay = sum(job.pay for job in jobs)
+        total_xp = sum(job.xp for job in jobs)
+        
+        # Use the flight time from the first job (all should be the same for same route)
+        flight_hours = jobs[0].flight_hours
+        
+        # Calculate average speed
+        speed_kts = distance / flight_hours if flight_hours > 0 else jobs[0].speed_kts
+        
+        # Create the multi-job leg
+        multi_leg = MultiJobLeg(
+            from_icao=from_icao,
+            to_icao=to_icao,
+            distance_nm=distance,
+            flight_hours=flight_hours,
+            speed_kts=speed_kts
+        )
+        
+        # Add all jobs to the leg
+        for job in jobs:
+            multi_leg.add_job(job)
+        
+        return multi_leg
     
     def _create_chained_multi_job_leg(self, jobs: List[JobInfo]) -> Optional[MultiJobLeg]:
         """Create a multi-job leg from a chained combination of jobs."""
@@ -1038,6 +1088,19 @@ class WorkOrderGenerator:
                 [destination] + list(self._used_jobs_tracking)).fetchone()[0]
             return count
     
+    def _get_sequential_route_bonus(self, current_location: str, job_departure: str, job_destination: str) -> float:
+        """Calculate bonus for maintaining sequential routes."""
+        # Perfect sequential route: job starts where we are
+        if job_departure.upper() == current_location.upper():
+            return 1.5  # 50% bonus for perfect sequential routes
+        
+        # Partial sequential route: job ends where we are (would need transit to start)
+        if job_destination.upper() == current_location.upper():
+            return 1.2  # 20% bonus for partial sequential routes
+        
+        # No sequential connection
+        return 1.0  # No bonus
+    
     
     def _calculate_payload_range_limit(self, plane_spec: Dict[str, Any], distance_nm: float) -> float:
         """Calculate maximum payload for given distance (copied from score_jobs.py)."""
@@ -1095,6 +1158,7 @@ class WorkOrderGenerator:
         iteration_count = 0
         
         while remaining_hours > 0.5 and iteration_count < max_iterations:  # Fill time more reasonably
+            
             # Find all available options
             multi_job_legs = self.find_multi_job_combinations(plane, current_location, remaining_hours, plane_spec)
             single_jobs = self.find_chainable_jobs(plane, current_location, remaining_hours, epsilon_hours)
@@ -1159,14 +1223,18 @@ class WorkOrderGenerator:
                             for i, job in enumerate(sorted_single, 1):
                                 print(f"      {i}. {job.xp} XP, ${job.pay:,.0f} pay, {work_order.get_priority_score(job):.2f} score")
             
-            # Pure efficiency-first selection
+            # Sequential route-first selection with efficiency consideration
             best_option = None
             best_efficiency_score = -1
             best_type = None
             
-            # 1. Check multi-job legs - highest efficiency potential
+            # 1. Check multi-job legs that start from current location - prioritize sequential routes
             for leg in feasible_multi_job_legs:
-                # Score based purely on efficiency (pay+XP per hour)
+                # Only consider multi-job legs that start from current location
+                if leg.from_icao.upper() != current_location.upper():
+                    continue
+                
+                # Score based on efficiency (pay+XP per hour)
                 total_value = sum(job.pay + job.xp for job in leg.jobs)
                 efficiency_score = total_value / leg.flight_hours if leg.flight_hours > 0 else 0
                 
@@ -1174,17 +1242,23 @@ class WorkOrderGenerator:
                 if len(leg.jobs) > 1:
                     efficiency_score *= 1.2
                 
+                # Sequential routes naturally have higher efficiency (no transit time needed)
+                # No artificial bonus needed - let natural efficiency determine the best choice
+                
                 if efficiency_score > best_efficiency_score:
                     best_efficiency_score = efficiency_score
                     best_option = leg
                     best_type = "multi_job"
             
-            # 2. Check local single jobs - highest efficiency from current location
+            # 2. Check local single jobs - prioritize sequential routes
             for job in jobs_from_current:
                 # Use the plane's priority-based score (pay/XP/balanced per hour)
                 efficiency_score = work_order.get_priority_score(job)
                 
-                # Small bonus for jobs that lead to good chaining opportunities
+                # Sequential routes naturally have higher efficiency (no transit time needed)
+                # No artificial bonus needed - let natural efficiency determine the best choice
+                
+                # Additional bonus for jobs that lead to good chaining opportunities
                 chaining_potential = self._get_job_chaining_potential(job.destination)
                 if chaining_potential > 0:
                     efficiency_score *= (1.0 + min(chaining_potential / 20.0, 0.2))  # Reduced to 20% bonus
@@ -1196,6 +1270,10 @@ class WorkOrderGenerator:
             
             # Add the best option
             if best_option and best_type == "multi_job":
+                # Debug: Show multi-job leg selection
+                if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
+                    print(f"    DEBUG {plane.registration}: Selected multi-job leg from {best_option.from_icao} to {best_option.to_icao} (current: {current_location})")
+                
                 # Add the multi-job leg
                 work_order.add_multi_job_leg(best_option)
                 
@@ -1209,6 +1287,10 @@ class WorkOrderGenerator:
                 iteration_count += 1
                 continue
             elif best_option and best_type == "single_job":
+                # Debug: Show single job selection
+                if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
+                    print(f"    DEBUG {plane.registration}: Selected single job from {best_option.legs[0]['from_icao']} to {best_option.destination} (current: {current_location})")
+                
                 # Add the single job
                 work_order.add_job(best_option, work_order.total_hours)
                 self._used_jobs_tracking.add(best_option.job_id)
@@ -1234,7 +1316,7 @@ class WorkOrderGenerator:
                     best_remote_score = -1
                     
                     for job in all_available_jobs:
-                        # Skip jobs that don't start from current location (these need transit)
+                        # Skip jobs that start from current location (already considered in local jobs)
                         if job.legs and job.legs[0]['from_icao'].upper() == current_location.upper():
                             continue  # Already considered in local jobs
                         
@@ -1247,8 +1329,8 @@ class WorkOrderGenerator:
                             job_efficiency = work_order.get_priority_score(job)
                             overall_efficiency = (job_efficiency * job.flight_hours) / total_time
                             
-                            # Transit jobs naturally limit themselves through efficiency
-                            # Only consider if overall efficiency is positive and reasonable
+                            # Natural efficiency limiting - transit time naturally reduces overall efficiency
+                            # This allows the algorithm to find truly optimal solutions
                             if overall_efficiency > best_remote_score and overall_efficiency > 0:
                                 best_remote_score = overall_efficiency
                                 best_remote_job = job
@@ -1302,8 +1384,17 @@ class WorkOrderGenerator:
                         work_order.add_job(transit_job, work_order.total_hours)
                         current_location = best_remote_job.legs[0]['from_icao']
                         remaining_hours = max_hours - work_order.total_hours
+                        
+                        # Now add the actual remote job
+                        # Debug: Show remote job selection
+                        if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
+                            print(f"    DEBUG {plane.registration}: Added remote job from {best_remote_job.legs[0]['from_icao']} to {best_remote_job.destination} with transit leg")
+                        
+                        work_order.add_job(best_remote_job, work_order.total_hours)
+                        self._used_jobs_tracking.add(best_remote_job.job_id)
+                        current_location = best_remote_job.destination
+                        remaining_hours = max_hours - work_order.total_hours
                         iteration_count += 1
-                        # Continue to allow more transit legs if needed
                         continue
             
             # No more options available
@@ -1313,7 +1404,14 @@ class WorkOrderGenerator:
         
         # Second pass: try to fill remaining time with smaller jobs (more aggressive)
         if remaining_hours > 0.2:  # More aggressive about filling remaining time
-            self._optimize_work_order_second_pass_simple(work_order, plane, current_location, 
+            # Use the work order's current location, not the loop's current_location variable
+            actual_current_location = work_order.get_current_location() if work_order.jobs else plane.current_location
+            
+            # Debug: Show second pass optimization
+            if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
+                print(f"    DEBUG {plane.registration}: Starting second pass optimization from {actual_current_location} with {remaining_hours:.2f} hours remaining")
+            
+            self._optimize_work_order_second_pass_simple(work_order, plane, actual_current_location, 
                                                         max_hours, epsilon_hours)
         
         # Remove trailing transit legs (they provide no Pay/XP value)
@@ -1321,7 +1419,29 @@ class WorkOrderGenerator:
         
         # Optimize job order to minimize penalties while preserving chaining
         if len(work_order.jobs) > 1:
+            # Debug: Show job order before optimization
+            if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
+                print(f"    DEBUG {plane.registration}: Job order before optimization:")
+                print(f"      Regular jobs: {len(work_order.jobs)}")
+                for i, job in enumerate(work_order.jobs):
+                    if hasattr(job, 'legs') and job.legs:
+                        from_loc = job.legs[0]['from_icao']
+                        to_loc = job.destination
+                        print(f"        {i+1}. {from_loc} -> {to_loc} ({job.source})")
+                print(f"      Multi-job legs: {len(work_order.multi_job_legs)}")
+                for i, leg in enumerate(work_order.multi_job_legs):
+                    print(f"        {i+1}. {leg.from_icao} -> {leg.to_icao} (multi-job leg)")
+            
             self._optimize_job_order_for_penalties(work_order)
+            
+            # Debug: Show job order after optimization
+            if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
+                print(f"    DEBUG {plane.registration}: Job order after optimization:")
+                for i, job in enumerate(work_order.jobs):
+                    if hasattr(job, 'legs') and job.legs:
+                        from_loc = job.legs[0]['from_icao']
+                        to_loc = job.destination
+                        print(f"      {i+1}. {from_loc} -> {to_loc} ({job.source})")
         
         return work_order
     
@@ -1402,6 +1522,10 @@ class WorkOrderGenerator:
                         best_job = job
             
             if best_job:
+                # Debug: Show second pass job selection
+                if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
+                    print(f"    DEBUG {plane.registration}: Second pass added job from {best_job.legs[0]['from_icao']} to {best_job.destination} (current: {current_location})")
+                
                 # Add the job
                 work_order.add_job(best_job, work_order.total_hours)
                 self._used_jobs_tracking.add(best_job.job_id)
@@ -1417,14 +1541,34 @@ class WorkOrderGenerator:
         if not work_order.jobs:
             return
         
+        # Debug: Show jobs before removing trailing transit legs
+        if 'ANT-07' in str(work_order.jobs[0].job_id if work_order.jobs else ''):
+            print(f"    DEBUG: Before removing trailing transit legs: {len(work_order.jobs)} jobs")
+            for i, job in enumerate(work_order.jobs):
+                if hasattr(job, 'legs') and job.legs:
+                    from_loc = job.legs[0]['from_icao']
+                    to_loc = job.destination
+                    print(f"      {i+1}. {from_loc} -> {to_loc} ({job.source})")
+        
         # Remove transit legs from the end of the work order
+        removed_count = 0
         while work_order.jobs and work_order.jobs[-1].source == "transit":
             removed_job = work_order.jobs.pop()
+            removed_count += 1
             # Update totals
             work_order.total_hours -= removed_job.flight_hours
             work_order.total_pay -= removed_job.pay
             work_order.total_xp -= removed_job.xp
             work_order.total_adjusted_pay -= removed_job.adjusted_pay_total
+        
+        # Debug: Show jobs after removing trailing transit legs
+        if 'ANT-07' in str(work_order.jobs[0].job_id if work_order.jobs else '') and removed_count > 0:
+            print(f"    DEBUG: Removed {removed_count} trailing transit legs: {len(work_order.jobs)} jobs remaining")
+            for i, job in enumerate(work_order.jobs):
+                if hasattr(job, 'legs') and job.legs:
+                    from_loc = job.legs[0]['from_icao']
+                    to_loc = job.destination
+                    print(f"      {i+1}. {from_loc} -> {to_loc} ({job.source})")
         
         # Recalculate totals to ensure consistency
         self._recalculate_work_order_totals(work_order)
@@ -1476,6 +1620,14 @@ class WorkOrderGenerator:
         groups = []
         current_group = [work_order.jobs[0]]
         
+        # Debug: Show job grouping process
+        print(f"    DEBUG: Starting job grouping for {len(work_order.jobs)} jobs")
+        for i, job in enumerate(work_order.jobs):
+            if hasattr(job, 'legs') and job.legs:
+                from_loc = job.legs[0]['from_icao']
+                to_loc = job.destination
+                print(f"      Job {i+1}: {from_loc} -> {to_loc} ({job.source})")
+        
         for i in range(1, len(work_order.jobs)):
             prev_job = work_order.jobs[i-1]
             curr_job = work_order.jobs[i]
@@ -1494,33 +1646,44 @@ class WorkOrderGenerator:
         if len(current_group) > 1:
             groups.append(current_group)
         
+        # Debug: Show groups found
+        print(f"    DEBUG: Found {len(groups)} groups with multiple jobs")
+        
         # Sort each group by time remaining (ascending = most urgent first)
         for group in groups:
             group.sort(key=lambda j: j.time_remaining_hours)
         
         # Rebuild the job list maintaining the overall order
         new_jobs = []
-        group_idx = 0
-        current_group_idx = 0
         
+        # Debug: Show what groups were found
+        print(f"    DEBUG: Found {len(groups)} groups to sort")
+        for i, group in enumerate(groups):
+            print(f"      Group {i}: {len(group)} jobs")
+        
+        # Simple approach: iterate through original jobs and replace with sorted versions if they're in groups
         for i, job in enumerate(work_order.jobs):
-            # Check if this job is part of a group that was sorted
-            if group_idx < len(groups) and current_group_idx < len(groups[group_idx]):
-                if job in groups[group_idx]:
-                    # Use the sorted version from the group
-                    new_jobs.append(groups[group_idx][current_group_idx])
-                    current_group_idx += 1
-                    
-                    # Move to next group if current group is exhausted
-                    if current_group_idx >= len(groups[group_idx]):
-                        group_idx += 1
-                        current_group_idx = 0
-                else:
-                    # Job not in a group, keep original order
-                    new_jobs.append(job)
-            else:
-                # Job not in a group, keep original order
+            job_replaced = False
+            
+            # Check if this job is in any group
+            for group in groups:
+                if job in group:
+                    # Find the sorted version of this job
+                    for sorted_job in group:
+                        if sorted_job.job_id == job.job_id:
+                            new_jobs.append(sorted_job)
+                            job_replaced = True
+                            print(f"    DEBUG: Replaced job {i+1} with sorted version")
+                            break
+                    break
+            
+            if not job_replaced:
+                # Job not in any group, keep original order
                 new_jobs.append(job)
+                print(f"    DEBUG: Added job {i+1} as-is (not in group)")
+        
+        # Debug: Show final job count
+        print(f"    DEBUG: Rebuilt job list: {len(work_order.jobs)} -> {len(new_jobs)} jobs")
         
         work_order.jobs = new_jobs
         
@@ -1829,37 +1992,41 @@ def export_to_csv(work_orders: List[WorkOrder], csv_path: str) -> None:
         accumulated_hours = 0.0
         job_seq = 1
         
-        # Export regular jobs
-        for job in wo.jobs:
-            accumulated_hours += job.flight_hours
-            is_late = accumulated_hours > job.time_remaining_hours
-            
-            all_rows.append([
-                wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
-                job_seq, job.job_id, job.source, job.departure, job.destination, job.distance_nm,
-                job.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
-                job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
-                job.speed_kts, job.min_airport_size or "", job.route, job.legs_count,
-                accumulated_hours, is_late, "single", job.total_payload_lbs
-            ])
-            job_seq += 1
-        
-        # Export multi-job legs
-        for leg in wo.multi_job_legs:
-            accumulated_hours += leg.flight_hours
-            
-            for i, job in enumerate(leg.jobs, 1):
+        # Export jobs and multi-job legs in execution order
+        for item_type, item in wo.execution_order:
+            if item_type == "job":
+                # Export regular job
+                job = item
+                accumulated_hours += job.flight_hours
                 is_late = accumulated_hours > job.time_remaining_hours
                 
                 all_rows.append([
                     wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
-                    job_seq, job.job_id, job.source, leg.from_icao, leg.to_icao, leg.distance_nm,
-                    leg.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
+                    job_seq, job.job_id, job.source, job.departure, job.destination, job.distance_nm,
+                    job.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
                     job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
-                    leg.speed_kts, job.min_airport_size or "", f"{leg.from_icao} -> {leg.to_icao}", job.legs_count,
-                    accumulated_hours, is_late, f"multi_{i}/{len(leg.jobs)}", job.total_payload_lbs
+                    job.speed_kts, job.min_airport_size or "", job.route, job.legs_count,
+                    accumulated_hours, is_late, "single", job.total_payload_lbs
                 ])
-            job_seq += 1
+                job_seq += 1
+                
+            elif item_type == "multi_leg":
+                # Export multi-job leg
+                leg = item
+                accumulated_hours += leg.flight_hours
+                
+                for i, job in enumerate(leg.jobs, 1):
+                    is_late = accumulated_hours > job.time_remaining_hours
+                    
+                    all_rows.append([
+                        wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
+                        job_seq, job.job_id, job.source, leg.from_icao, leg.to_icao, leg.distance_nm,
+                        leg.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
+                        job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
+                        leg.speed_kts, job.min_airport_size or "", f"{leg.from_icao} -> {leg.to_icao}", job.legs_count,
+                        accumulated_hours, is_late, f"multi_{i}/{len(leg.jobs)}", job.total_payload_lbs
+                    ])
+                job_seq += 1
     
     # Write all data in a single operation
     with open(csv_path, 'w', newline='', encoding='utf-8', buffering=8192) as f:
