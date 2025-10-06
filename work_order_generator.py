@@ -66,7 +66,7 @@ def safe_file_operation(operation_func, file_path: str, operation_name: str, max
             return operation_func()
         except (PermissionError, OSError) as e:
             if attempt < max_retries - 1:
-                print(f"\n⚠️  Cannot {operation_name} '{file_path}' - file may be open in another program.")
+                print(f"\nCannot {operation_name} '{file_path}' - file may be open in another program.")
                 print(f"   Error: {e}")
                 print(f"\nPlease close the file and press Enter to retry, or type 'q' and Enter to quit:")
                 
@@ -76,14 +76,14 @@ def safe_file_operation(operation_func, file_path: str, operation_name: str, max
                     return False
                 print("Retrying...")
             else:
-                print(f"\n❌ Failed to {operation_name} '{file_path}' after {max_retries} attempts.")
+                print(f"\nFailed to {operation_name} '{file_path}' after {max_retries} attempts.")
                 print("Please close the file manually and run the script again.")
                 return False
         except KeyboardInterrupt:
             print(f"\n\nOperation cancelled by user (Ctrl+C) during {operation_name}.")
             return False
         except Exception as e:
-            print(f"❌ Unexpected error during {operation_name}: {e}")
+            print(f"Unexpected error during {operation_name}: {e}")
             return False
     
     return False
@@ -366,10 +366,11 @@ class WorkOrder:
 class WorkOrderGenerator:
     """Generates optimized work orders for idle planes."""
     
-    def __init__(self, db_path: str, optimizer: Optional[PerformanceOptimizer] = None):
+    def __init__(self, db_path: str, optimizer: Optional[PerformanceOptimizer] = None, enable_penalty_optimization: bool = True):
         self.original_db_path = db_path
         self.optimizer = optimizer
         self.used_jobs: Set[str] = set()
+        self.enable_penalty_optimization = enable_penalty_optimization
         
         # Performance optimization: Load entire database into RAM
         self._ram_db_path = self._create_ram_database()
@@ -1515,7 +1516,11 @@ class WorkOrderGenerator:
                 for i, leg in enumerate(work_order.multi_job_legs):
                     print(f"        {i+1}. {leg.from_icao} -> {leg.to_icao} (multi-job leg)")
             
-            self._optimize_job_order_for_penalties(work_order)
+            # Apply penalty optimization unless disabled
+            if self.enable_penalty_optimization:
+                print(f"    DEBUG: Starting penalty optimization for {len(work_order.jobs)} jobs")
+                self._optimize_job_order_for_penalties(work_order)
+                print(f"    DEBUG: After penalty optimization: {len(work_order.jobs)} jobs")
             
             # Debug: Show job order after optimization
             if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
@@ -1699,6 +1704,8 @@ class WorkOrderGenerator:
         if len(work_order.jobs) <= 1:
             return
         
+        print(f"    DEBUG: Starting penalty optimization for {len(work_order.jobs)} jobs")
+        
         # Group consecutive jobs by departure/destination
         groups = []
         current_group = [work_order.jobs[0]]
@@ -1757,31 +1764,44 @@ class WorkOrderGenerator:
         for i, group in enumerate(groups):
             print(f"      Group {i}: {len(group)} jobs")
         
-        # Simple approach: iterate through original jobs and replace with sorted versions if they're in groups
-        for i, job in enumerate(work_order.jobs):
-            job_replaced = False
+        # CONSERVATIVE APPROACH: Rebuild the job list with sorted groups in correct order
+        if groups:
+            print(f"    DEBUG: Reordering {len(groups)} groups of jobs")
             
-            # Check if this job is in any group
+            # Create a mapping from job_id to which group it belongs to
+            job_to_group = {}
             for group in groups:
-                if job in group:
-                    # Find the sorted version of this job
-                    for sorted_job in group:
-                        if sorted_job.job_id == job.job_id:
-                            new_jobs.append(sorted_job)
-                            job_replaced = True
-                            print(f"    DEBUG: Replaced job {i+1} with sorted version")
-                            break
-                    break
+                for job in group:
+                    job_to_group[job.job_id] = group
             
-            if not job_replaced:
-                # Job not in any group, keep original order
-                new_jobs.append(job)
-                print(f"    DEBUG: Added job {i+1} as-is (not in group)")
+            # Rebuild the job list by walking through original order and inserting sorted groups
+            new_jobs = []
+            i = 0
+            while i < len(work_order.jobs):
+                job = work_order.jobs[i]
+                
+                if job.job_id in job_to_group:
+                    # This job is part of a group - add the entire sorted group
+                    group = job_to_group[job.job_id]
+                    new_jobs.extend(group)
+                    print(f"    DEBUG: Added sorted group of {len(group)} jobs")
+                    
+                    # Skip all other jobs in this group
+                    for other_job in group:
+                        if other_job.job_id != job.job_id:
+                            i += 1  # Skip this job as it's already in the group
+                    i += 1  # Skip the current job
+                else:
+                    # This job is not in any group - add it as-is
+                    new_jobs.append(job)
+                    i += 1
+            
+            # Replace the work order jobs with the reordered list
+            work_order.jobs = new_jobs
+            print(f"    DEBUG: Rebuilt job list with sorted groups")
         
-        # Debug: Show final job count
-        print(f"    DEBUG: Rebuilt job list: {len(work_order.jobs)} -> {len(new_jobs)} jobs")
-        
-        work_order.jobs = new_jobs
+        # Debug: Show final job count (should be unchanged)
+        print(f"    DEBUG: Final job count: {len(work_order.jobs)} jobs (should be unchanged)")
         
         # Recalculate totals and penalties with correct accumulated times after reordering
         self._recalculate_work_order_totals(work_order)
@@ -1792,6 +1812,9 @@ class WorkOrderGenerator:
         work_order.total_pay = 0.0
         work_order.total_xp = 0.0
         work_order.total_adjusted_pay = 0.0
+        
+        # Rebuild execution_order to match the new job order
+        work_order.execution_order = []
         
         accumulated_hours = 0.0
         for job in work_order.jobs:
@@ -1806,14 +1829,20 @@ class WorkOrderGenerator:
             work_order.total_pay += job.pay
             work_order.total_xp += job.xp
             work_order.total_adjusted_pay += job.adjusted_pay_total
+            
+            # Add job to execution order in new position
+            work_order.execution_order.append(("job", job))
         
-        # Also include multi-job legs in totals
+        # Also include multi-job legs in totals and execution order
         for leg in work_order.multi_job_legs:
             work_order.total_hours += leg.flight_hours
             for job in leg.jobs:
                 work_order.total_pay += job.pay
                 work_order.total_xp += job.xp
                 work_order.total_adjusted_pay += job.adjusted_pay_total
+            
+            # Add multi-job leg to execution order
+            work_order.execution_order.append(("multi_leg", leg))
     
     def generate_all_work_orders(self, max_hours: float = 24.0, 
                                 epsilon_hours: float = 0.5) -> List[WorkOrder]:
@@ -2186,6 +2215,8 @@ def main():
                        help="Output format: excel or csv (default: excel)")
     parser.add_argument("--no-export", action="store_true",
                        help="Skip file export")
+    parser.add_argument("--no-penalty-optimization", action="store_true",
+                       help="Disable penalty optimization (sort by time remaining)")
     
     args = parser.parse_args()
     
@@ -2209,7 +2240,8 @@ def main():
         optimizer = None
     
     # Generate work orders
-    generator = WorkOrderGenerator(config.db_path, optimizer)
+    enable_penalty_opt = not args.no_penalty_optimization
+    generator = WorkOrderGenerator(config.db_path, optimizer, enable_penalty_opt)
     work_orders = generator.generate_all_work_orders(args.max_hours, args.epsilon_hours)
     
     # Print results
@@ -2224,11 +2256,11 @@ def main():
         elif args.format == "csv" and not output_file.endswith('.csv'):
             output_file = output_file.rsplit('.', 1)[0] + '.csv'
         
-        print(f"\n📊 Exporting work orders to {args.format.upper()} format...")
+        print(f"\nExporting work orders to {args.format.upper()} format...")
         
         # Remove existing file if it exists
         if not safe_remove_file(output_file):
-            print("❌ Cannot proceed without removing the existing file.")
+            print("Cannot proceed without removing the existing file.")
             return 1
         
         # Export based on format
@@ -2239,16 +2271,16 @@ def main():
             success = export_to_csv(work_orders, output_file)
         
         if success:
-            print(f"✅ Work orders exported successfully to: {output_file}")
+            print(f"Work orders exported successfully to: {output_file}")
             
             # Auto-open the file
-            print("📂 Opening file...")
+            print("Opening file...")
             if open_file(output_file):
-                print("✅ File opened successfully!")
+                print("File opened successfully!")
             else:
-                print("ℹ️  File saved but could not be auto-opened.")
+                print("File saved but could not be auto-opened.")
         else:
-            print("❌ Failed to export work orders.")
+            print("Failed to export work orders.")
             return 1
     elif not work_orders:
         print("\nNo work orders generated.")

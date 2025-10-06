@@ -200,8 +200,19 @@ def main():
 		# Generate work orders automatically (unless disabled)
 		if not args.no_work_orders:
 			print("Generating work orders...")
-			from work_order_generator import main as work_order_main
-			work_order_main()
+			from work_order_generator import WorkOrderGenerator, PerformanceOptimizer, Config
+			
+			# Initialize components
+			config = Config()
+			optimizer = PerformanceOptimizer(config.db_path)
+			
+			# Generate work orders with default settings (penalty optimization enabled)
+			generator = WorkOrderGenerator(config.db_path, optimizer, enable_penalty_optimization=True)
+			work_orders = generator.generate_all_work_orders(max_hours=24.0, epsilon_hours=0.5)
+			
+			# Export work orders to Excel
+			from work_order_generator import export_to_excel
+			export_to_excel(work_orders, "workorders.xlsx")
 		else:
 			print("Skipping work order generation (--no-work-orders specified)")
 		
