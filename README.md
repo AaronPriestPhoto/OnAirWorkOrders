@@ -1,6 +1,7 @@
 ## OnAir Work Orders
 
-Generate, score, and export OnAir company jobs into optimized work orders with CSV/Excel outputs.
+Generate, score, and export OnAir Airline Manager company jobs (created with FBO queries) into optimized work orders with CSV/Excel outputs.
+https://www.onair.company/
 
 ### Features
 - Fetches jobs from OnAir API (company and FBOs) or uses cached data (offline)
