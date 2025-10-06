@@ -6,8 +6,18 @@ import math
 import pandas as pd
 from datetime import datetime, timedelta
 from tqdm import tqdm
+from pathlib import Path
 
-# Scripts are now in the root directory - no path modification needed
+# Ensure working directory is always the script's directory
+script_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(script_dir)
+
+# Also ensure project root is on sys.path for imports
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
+
+# Set up BASE_DIR for consistent file path references
+BASE_DIR = Path(__file__).resolve().parent
 
 from onair import config as cfg_mod
 from onair import api as api_mod
@@ -366,8 +376,7 @@ def main():
 
 def _get_airports_from_sample_jobs() -> set:
 	"""Extract all unique airports from sample jobs in planes.xlsx."""
-	current_dir = os.path.dirname(os.path.abspath(__file__))
-	excel_path = os.path.join(current_dir, "planes.xlsx")
+	excel_path = BASE_DIR / "planes.xlsx"
 	
 	if not os.path.exists(excel_path):
 		return set()
