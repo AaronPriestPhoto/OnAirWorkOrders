@@ -2057,14 +2057,15 @@ def create_excel_workbook():
         ws = wb.active
         ws.title = "Work Orders"
         
-        # Add headers
+        # Add headers (custom order with plane_id removed)
         headers = [
-            'work_order_id', 'plane_id', 'plane_registration', 'plane_type', 'priority',
-            'job_sequence', 'job_id', 'source', 'departure', 'destination', 'distance_nm',
-            'flight_hours', 'pay', 'xp', 'pay_per_hour', 'xp_per_hour', 'balance_score',
-            'time_remaining_hours', 'penalty_amount', 'adjusted_pay_per_hour', 'adjusted_pay_total',
-            'speed_kts', 'min_airport_size', 'route', 'legs_count',
-            'accumulated_hours', 'is_late', 'job_type', 'payload_lbs'
+            'plane_registration', 'work_order_id', 'job_sequence', 'job_type', 'source', 'job_id',
+            'departure', 'destination', 'route', 'legs_count', 'pay', 'xp',
+            # The rest of the columns in their original relative order (excluding plane_id)
+            'plane_type', 'priority', 'distance_nm', 'flight_hours', 'pay_per_hour', 'xp_per_hour',
+            'balance_score', 'time_remaining_hours', 'penalty_amount', 'adjusted_pay_per_hour',
+            'adjusted_pay_total', 'speed_kts', 'min_airport_size', 'accumulated_hours', 'is_late',
+            'payload_lbs'
         ]
         
         for col, header in enumerate(headers, 1):
@@ -2097,37 +2098,38 @@ def format_excel_workbook(wb, ws):
             adjusted_width = min(max_length + 2, 30)
             ws.column_dimensions[column_letter].width = adjusted_width
         
-        # Format specific columns for better readability
-        # Pay columns (13, 15, 19, 20) - currency format
-        for col in [13, 15, 19, 20]:
+        # Format specific columns for better readability using header names
+        header_to_index = {}
+        for col in range(1, ws.max_column + 1):
+            name = (ws.cell(row=1, column=col).value or '').strip()
+            if name:
+                header_to_index[name] = col
+
+        # Currency format for pay columns
+        for name in ['pay', 'pay_per_hour', 'adjusted_pay_per_hour', 'adjusted_pay_total']:
+            col = header_to_index.get(name)
+            if col:
+                for row in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=row, column=col)
+                    if cell.value is not None:
+                        cell.number_format = '#,##0.00'
+
+        # One decimal place
+        for name in ['xp', 'distance_nm', 'time_remaining_hours']:
+            col = header_to_index.get(name)
+            if col:
+                for row in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=row, column=col)
+                    if cell.value is not None:
+                        cell.number_format = '0.0'
+
+        # Two decimal places for flight hours
+        col = header_to_index.get('flight_hours')
+        if col:
             for row in range(2, ws.max_row + 1):
                 cell = ws.cell(row=row, column=col)
                 if cell.value is not None:
-                    cell.number_format = '#,##0.00'
-        
-        # XP column (14) - 1 decimal place
-        for row in range(2, ws.max_row + 1):
-            cell = ws.cell(row=row, column=14)
-            if cell.value is not None:
-                cell.number_format = '0.0'
-        
-        # Distance column (11) - 1 decimal place
-        for row in range(2, ws.max_row + 1):
-            cell = ws.cell(row=row, column=11)
-            if cell.value is not None:
-                cell.number_format = '0.0'
-        
-        # Flight hours column (12) - 2 decimal places
-        for row in range(2, ws.max_row + 1):
-            cell = ws.cell(row=row, column=12)
-            if cell.value is not None:
-                cell.number_format = '0.00'
-        
-        # Time remaining column (18) - 1 decimal place
-        for row in range(2, ws.max_row + 1):
-            cell = ws.cell(row=row, column=18)
-            if cell.value is not None:
-                cell.number_format = '0.0'
+                    cell.number_format = '0.00'
         
         return True
     except Exception as e:
@@ -2154,16 +2156,44 @@ def export_to_excel(work_orders: List[WorkOrder], excel_path: str) -> bool:
                     job = item
                     accumulated_hours += job.flight_hours
                     is_late = accumulated_hours > job.time_remaining_hours
-                    
+                    # Transformations
+                    display_source = job.source
+                    if isinstance(display_source, str) and display_source.startswith('fbo:'):
+                        display_source = (job.departure or '').strip().upper()
+                    display_job_id = (job.job_id or '')[:5]
+
                     row_data = [
-                        wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
-                        job_seq, job.job_id, job.source, job.departure, job.destination, job.distance_nm,
-                        job.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
-                        job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
-                        job.speed_kts, job.min_airport_size or "", job.route, job.legs_count,
-                        accumulated_hours, is_late, "single", job.total_payload_lbs
+                        wo.plane_registration,
+                        wo_id,
+                        job_seq,
+                        "single",
+                        display_source,
+                        display_job_id,
+                        job.departure,
+                        job.destination,
+                        job.route,
+                        job.legs_count,
+                        job.pay,
+                        job.xp,
+                        # Rest in original relative order (excluding plane_id)
+                        wo.plane_type,
+                        wo.priority,
+                        job.distance_nm,
+                        job.flight_hours,
+                        job.pay_per_hour,
+                        job.xp_per_hour,
+                        job.balance_score,
+                        job.time_remaining_hours,
+                        job.penalty_amount,
+                        job.adjusted_pay_per_hour,
+                        job.adjusted_pay_total,
+                        job.speed_kts,
+                        job.min_airport_size or "",
+                        accumulated_hours,
+                        is_late,
+                        job.total_payload_lbs,
                     ]
-                    
+
                     ws.append(row_data)
                     job_seq += 1
                     
@@ -2174,16 +2204,43 @@ def export_to_excel(work_orders: List[WorkOrder], excel_path: str) -> bool:
                     
                     for i, job in enumerate(leg.jobs, 1):
                         is_late = accumulated_hours > job.time_remaining_hours
-                        
+                        display_source = job.source
+                        if isinstance(display_source, str) and display_source.startswith('fbo:'):
+                            display_source = (leg.from_icao or '').strip().upper()
+                        display_job_id = (job.job_id or '')[:5]
+
                         row_data = [
-                            wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
-                            job_seq, job.job_id, job.source, leg.from_icao, leg.to_icao, leg.distance_nm,
-                            leg.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
-                            job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
-                            leg.speed_kts, job.min_airport_size or "", f"{leg.from_icao} -> {leg.to_icao}", job.legs_count,
-                            accumulated_hours, is_late, f"multi_{i}/{len(leg.jobs)}", job.total_payload_lbs
+                            wo.plane_registration,
+                            wo_id,
+                            job_seq,
+                            f"multi_{i}/{len(leg.jobs)}",
+                            display_source,
+                            display_job_id,
+                            leg.from_icao,
+                            leg.to_icao,
+                            f"{leg.from_icao} -> {leg.to_icao}",
+                            job.legs_count,
+                            job.pay,
+                            job.xp,
+                            # Rest in original relative order (excluding plane_id)
+                            wo.plane_type,
+                            wo.priority,
+                            leg.distance_nm,
+                            leg.flight_hours,
+                            job.pay_per_hour,
+                            job.xp_per_hour,
+                            job.balance_score,
+                            job.time_remaining_hours,
+                            job.penalty_amount,
+                            job.adjusted_pay_per_hour,
+                            job.adjusted_pay_total,
+                            leg.speed_kts,
+                            job.min_airport_size or "",
+                            accumulated_hours,
+                            is_late,
+                            job.total_payload_lbs,
                         ]
-                        
+
                         ws.append(row_data)
                     job_seq += 1
         
@@ -2298,12 +2355,12 @@ def export_to_csv(work_orders: List[WorkOrder], csv_path: str) -> bool:
         
         # Header
         header = [
-            'work_order_id', 'plane_id', 'plane_registration', 'plane_type', 'priority',
-            'job_sequence', 'job_id', 'source', 'departure', 'destination', 'distance_nm',
-            'flight_hours', 'pay', 'xp', 'pay_per_hour', 'xp_per_hour', 'balance_score',
-            'time_remaining_hours', 'penalty_amount', 'adjusted_pay_per_hour', 'adjusted_pay_total',
-            'speed_kts', 'min_airport_size', 'route', 'legs_count',
-            'accumulated_hours', 'is_late', 'job_type', 'payload_lbs'
+            'plane_registration', 'work_order_id', 'job_sequence', 'job_type', 'source', 'job_id',
+            'departure', 'destination', 'route', 'legs_count', 'pay', 'xp',
+            'plane_type', 'priority', 'distance_nm', 'flight_hours', 'pay_per_hour', 'xp_per_hour',
+            'balance_score', 'time_remaining_hours', 'penalty_amount', 'adjusted_pay_per_hour',
+            'adjusted_pay_total', 'speed_kts', 'min_airport_size', 'accumulated_hours', 'is_late',
+            'payload_lbs'
         ]
         all_rows.append(header)
         
@@ -2319,14 +2376,40 @@ def export_to_csv(work_orders: List[WorkOrder], csv_path: str) -> bool:
                     job = item
                     accumulated_hours += job.flight_hours
                     is_late = accumulated_hours > job.time_remaining_hours
-                    
+                    display_source = job.source
+                    if isinstance(display_source, str) and display_source.startswith('fbo:'):
+                        display_source = (job.departure or '').strip().upper()
+                    display_job_id = (job.job_id or '')[:5]
+
                     all_rows.append([
-                        wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
-                        job_seq, job.job_id, job.source, job.departure, job.destination, job.distance_nm,
-                        job.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
-                        job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
-                        job.speed_kts, job.min_airport_size or "", job.route, job.legs_count,
-                        accumulated_hours, is_late, "single", job.total_payload_lbs
+                        wo.plane_registration,
+                        wo_id,
+                        job_seq,
+                        "single",
+                        display_source,
+                        display_job_id,
+                        job.departure,
+                        job.destination,
+                        job.route,
+                        job.legs_count,
+                        job.pay,
+                        job.xp,
+                        wo.plane_type,
+                        wo.priority,
+                        job.distance_nm,
+                        job.flight_hours,
+                        job.pay_per_hour,
+                        job.xp_per_hour,
+                        job.balance_score,
+                        job.time_remaining_hours,
+                        job.penalty_amount,
+                        job.adjusted_pay_per_hour,
+                        job.adjusted_pay_total,
+                        job.speed_kts,
+                        job.min_airport_size or "",
+                        accumulated_hours,
+                        is_late,
+                        job.total_payload_lbs,
                     ])
                     job_seq += 1
                     
@@ -2337,14 +2420,40 @@ def export_to_csv(work_orders: List[WorkOrder], csv_path: str) -> bool:
                     
                     for i, job in enumerate(leg.jobs, 1):
                         is_late = accumulated_hours > job.time_remaining_hours
-                        
+                        display_source = job.source
+                        if isinstance(display_source, str) and display_source.startswith('fbo:'):
+                            display_source = (leg.from_icao or '').strip().upper()
+                        display_job_id = (job.job_id or '')[:5]
+
                         all_rows.append([
-                            wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
-                            job_seq, job.job_id, job.source, leg.from_icao, leg.to_icao, leg.distance_nm,
-                            leg.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
-                            job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
-                            leg.speed_kts, job.min_airport_size or "", f"{leg.from_icao} -> {leg.to_icao}", job.legs_count,
-                            accumulated_hours, is_late, f"multi_{i}/{len(leg.jobs)}", job.total_payload_lbs
+                            wo.plane_registration,
+                            wo_id,
+                            job_seq,
+                            f"multi_{i}/{len(leg.jobs)}",
+                            display_source,
+                            display_job_id,
+                            leg.from_icao,
+                            leg.to_icao,
+                            f"{leg.from_icao} -> {leg.to_icao}",
+                            job.legs_count,
+                            job.pay,
+                            job.xp,
+                            wo.plane_type,
+                            wo.priority,
+                            leg.distance_nm,
+                            leg.flight_hours,
+                            job.pay_per_hour,
+                            job.xp_per_hour,
+                            job.balance_score,
+                            job.time_remaining_hours,
+                            job.penalty_amount,
+                            job.adjusted_pay_per_hour,
+                            job.adjusted_pay_total,
+                            leg.speed_kts,
+                            job.min_airport_size or "",
+                            accumulated_hours,
+                            is_late,
+                            job.total_payload_lbs,
                         ])
                     job_seq += 1
         
