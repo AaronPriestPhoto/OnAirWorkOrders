@@ -12,6 +12,11 @@ __pycache__/
 *.db
 *.db.backup
 
+# Generated output files
+workorders.csv
+workorders.xlsx
+*.xlsx
+
 # Virtual environments
 .venv/
 venv/

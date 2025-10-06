@@ -21,15 +21,98 @@ import sqlite3
 import sys
 import shutil
 import tempfile
+import webbrowser
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Set, Tuple, Any
 from math import sqrt
+from pathlib import Path
+
+# Ensure working directory is always the script's directory
+script_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(script_dir)
+
+# Also ensure project root is on sys.path for imports
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
+
+# Set up BASE_DIR for consistent file path references
+BASE_DIR = Path(__file__).resolve().parent
 
 from onair.config import load_config
 from onair import db as db_mod
 from performance_optimizer import PerformanceOptimizer
+
+
+# ----------------------------
+# Safe File Operations
+# ----------------------------
+def safe_file_operation(operation_func, file_path: str, operation_name: str, max_retries: int = 10):
+    """
+    Safely perform file operations with user prompts when file is in use.
+    
+    Args:
+        operation_func: Function to execute (should return True on success)
+        file_path: Path to the file
+        operation_name: Description of the operation for user prompts
+        max_retries: Maximum number of retry attempts
+    
+    Returns:
+        True if operation succeeded, False if user cancelled
+    """
+    for attempt in range(max_retries):
+        try:
+            return operation_func()
+        except (PermissionError, OSError) as e:
+            if attempt < max_retries - 1:
+                print(f"\n⚠️  Cannot {operation_name} '{file_path}' - file may be open in another program.")
+                print(f"   Error: {e}")
+                print(f"\nPlease close the file and press Enter to retry, or type 'q' and Enter to quit:")
+                
+                user_input = input().strip().lower()
+                if user_input == 'q':
+                    print("Operation cancelled by user.")
+                    return False
+                print("Retrying...")
+            else:
+                print(f"\n❌ Failed to {operation_name} '{file_path}' after {max_retries} attempts.")
+                print("Please close the file manually and run the script again.")
+                return False
+        except KeyboardInterrupt:
+            print(f"\n\nOperation cancelled by user (Ctrl+C) during {operation_name}.")
+            return False
+        except Exception as e:
+            print(f"❌ Unexpected error during {operation_name}: {e}")
+            return False
+    
+    return False
+
+
+def safe_remove_file(file_path: str) -> bool:
+    """Safely remove a file with user prompts if it's in use."""
+    if not os.path.exists(file_path):
+        return True
+    
+    def remove_operation():
+        os.remove(file_path)
+        return True
+    
+    return safe_file_operation(remove_operation, file_path, "remove file")
+
+
+def open_file(file_path: str) -> bool:
+    """Open file with the default application."""
+    try:
+        # Convert to absolute path for better compatibility
+        abs_path = os.path.abspath(file_path)
+        
+        # Use webbrowser to open files (works cross-platform)
+        webbrowser.open(f"file://{abs_path}")
+        return True
+    except Exception as e:
+        print(f"Warning: Could not auto-open file: {e}")
+        return False
 
 
 @dataclass
@@ -1623,24 +1706,32 @@ class WorkOrderGenerator:
         # Debug: Show job grouping process
         print(f"    DEBUG: Starting job grouping for {len(work_order.jobs)} jobs")
         for i, job in enumerate(work_order.jobs):
-            if hasattr(job, 'legs') and job.legs:
-                from_loc = job.legs[0]['from_icao']
-                to_loc = job.destination
-                print(f"      Job {i+1}: {from_loc} -> {to_loc} ({job.source})")
+            # Use consistent departure/destination logic
+            from_loc = job.legs[0]['from_icao'] if job.legs else job.departure
+            to_loc = job.legs[-1]['to_icao'] if job.legs else job.destination
+            print(f"      Job {i+1}: {from_loc} -> {to_loc} ({job.source}) [time_remaining: {job.time_remaining_hours:.1f}h]")
         
         for i in range(1, len(work_order.jobs)):
             prev_job = work_order.jobs[i-1]
             curr_job = work_order.jobs[i]
             
+            # Use consistent departure/destination logic for comparison
+            prev_from = prev_job.legs[0]['from_icao'] if prev_job.legs else prev_job.departure
+            prev_to = prev_job.legs[-1]['to_icao'] if prev_job.legs else prev_job.destination
+            curr_from = curr_job.legs[0]['from_icao'] if curr_job.legs else curr_job.departure
+            curr_to = curr_job.legs[-1]['to_icao'] if curr_job.legs else curr_job.destination
+            
             # Check if jobs have same departure and destination
-            if (prev_job.departure == curr_job.departure and 
-                prev_job.destination == curr_job.destination):
+            if prev_from == curr_from and prev_to == curr_to:
                 current_group.append(curr_job)
+                print(f"    DEBUG: Added job {i+1} to group (same route: {curr_from} -> {curr_to})")
             else:
                 # End current group and start new one
                 if len(current_group) > 1:
                     groups.append(current_group)
+                    print(f"    DEBUG: Closed group with {len(current_group)} jobs")
                 current_group = [curr_job]
+                print(f"    DEBUG: Started new group with job {i+1} (route: {curr_from} -> {curr_to})")
         
         # Add the last group if it has multiple jobs
         if len(current_group) > 1:
@@ -1650,8 +1741,13 @@ class WorkOrderGenerator:
         print(f"    DEBUG: Found {len(groups)} groups with multiple jobs")
         
         # Sort each group by time remaining (ascending = most urgent first)
-        for group in groups:
+        for i, group in enumerate(groups):
+            print(f"    DEBUG: Sorting group {i+1} with {len(group)} jobs by time remaining")
+            original_order = [f"{j.job_id[:8]}...({j.time_remaining_hours:.1f}h)" for j in group]
             group.sort(key=lambda j: j.time_remaining_hours)
+            sorted_order = [f"{j.job_id[:8]}...({j.time_remaining_hours:.1f}h)" for j in group]
+            print(f"      Original: {original_order}")
+            print(f"      Sorted:   {sorted_order}")
         
         # Rebuild the job list maintaining the overall order
         new_jobs = []
@@ -1919,6 +2015,164 @@ def print_work_orders(work_orders: List[WorkOrder]) -> None:
         print(f"\n{'-'*60}")
 
 
+# ----------------------------
+# Excel Export Functions
+# ----------------------------
+def create_excel_workbook():
+    """Create a new Excel workbook with headers and formatting."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+        
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Work Orders"
+        
+        # Add headers
+        headers = [
+            'work_order_id', 'plane_id', 'plane_registration', 'plane_type', 'priority',
+            'job_sequence', 'job_id', 'source', 'departure', 'destination', 'distance_nm',
+            'flight_hours', 'pay', 'xp', 'pay_per_hour', 'xp_per_hour', 'balance_score',
+            'time_remaining_hours', 'penalty_amount', 'adjusted_pay_per_hour', 'adjusted_pay_total',
+            'speed_kts', 'min_airport_size', 'route', 'legs_count',
+            'accumulated_hours', 'is_late', 'job_type', 'payload_lbs'
+        ]
+        
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        
+        return wb, ws
+    except ImportError:
+        print("Warning: openpyxl not available. Install with: pip install openpyxl")
+        return None, None
+
+
+def format_excel_workbook(wb, ws):
+    """Format Excel workbook with auto-sized columns and styling."""
+    try:
+        from openpyxl.utils import get_column_letter
+        
+        # Auto-size columns based on content
+        for col in range(1, ws.max_column + 1):
+            column_letter = get_column_letter(col)
+            max_length = 0
+            
+            for row in range(1, ws.max_row + 1):
+                cell_value = str(ws.cell(row=row, column=col).value or "")
+                max_length = max(max_length, len(cell_value))
+            
+            # Set reasonable column widths
+            adjusted_width = min(max_length + 2, 30)
+            ws.column_dimensions[column_letter].width = adjusted_width
+        
+        # Format specific columns for better readability
+        # Pay columns (13, 15, 19, 20) - currency format
+        for col in [13, 15, 19, 20]:
+            for row in range(2, ws.max_row + 1):
+                cell = ws.cell(row=row, column=col)
+                if cell.value is not None:
+                    cell.number_format = '#,##0.00'
+        
+        # XP column (14) - 1 decimal place
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=14)
+            if cell.value is not None:
+                cell.number_format = '0.0'
+        
+        # Distance column (11) - 1 decimal place
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=11)
+            if cell.value is not None:
+                cell.number_format = '0.0'
+        
+        # Flight hours column (12) - 2 decimal places
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=12)
+            if cell.value is not None:
+                cell.number_format = '0.00'
+        
+        # Time remaining column (18) - 1 decimal place
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=18)
+            if cell.value is not None:
+                cell.number_format = '0.0'
+        
+        return True
+    except Exception as e:
+        print(f"Warning: Could not format Excel file: {e}")
+        return False
+
+
+def export_to_excel(work_orders: List[WorkOrder], excel_path: str) -> bool:
+    """Export work orders to Excel with formatting. Returns True if successful."""
+    wb, ws = create_excel_workbook()
+    if not wb or not ws:
+        return False
+    
+    try:
+        # Add data rows
+        for wo_id, wo in enumerate(work_orders, 1):
+            accumulated_hours = 0.0
+            job_seq = 1
+            
+            # Export jobs and multi-job legs in execution order
+            for item_type, item in wo.execution_order:
+                if item_type == "job":
+                    # Export regular job
+                    job = item
+                    accumulated_hours += job.flight_hours
+                    is_late = accumulated_hours > job.time_remaining_hours
+                    
+                    row_data = [
+                        wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
+                        job_seq, job.job_id, job.source, job.departure, job.destination, job.distance_nm,
+                        job.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
+                        job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
+                        job.speed_kts, job.min_airport_size or "", job.route, job.legs_count,
+                        accumulated_hours, is_late, "single", job.total_payload_lbs
+                    ]
+                    
+                    ws.append(row_data)
+                    job_seq += 1
+                    
+                elif item_type == "multi_leg":
+                    # Export multi-job leg
+                    leg = item
+                    accumulated_hours += leg.flight_hours
+                    
+                    for i, job in enumerate(leg.jobs, 1):
+                        is_late = accumulated_hours > job.time_remaining_hours
+                        
+                        row_data = [
+                            wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
+                            job_seq, job.job_id, job.source, leg.from_icao, leg.to_icao, leg.distance_nm,
+                            leg.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
+                            job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
+                            leg.speed_kts, job.min_airport_size or "", f"{leg.from_icao} -> {leg.to_icao}", job.legs_count,
+                            accumulated_hours, is_late, f"multi_{i}/{len(leg.jobs)}", job.total_payload_lbs
+                        ]
+                        
+                        ws.append(row_data)
+                    job_seq += 1
+        
+        # Format the workbook
+        format_excel_workbook(wb, ws)
+        
+        # Save with safe file operations
+        def save_operation():
+            wb.save(excel_path)
+            return True
+        
+        return safe_file_operation(save_operation, excel_path, "save Excel file")
+        
+    except Exception as e:
+        print(f"Error creating Excel file: {e}")
+        return False
+
+
 def main():
     """Main function."""
     parser = argparse.ArgumentParser(description="Generate work orders for idle planes")
@@ -1926,10 +2180,12 @@ def main():
                        help="Maximum hours for work orders (default: 24.0)")
     parser.add_argument("--epsilon-hours", type=float, default=0.5,
                        help="Epsilon soft limit in hours (default: 0.5)")
-    parser.add_argument("--csv", default="workorders.csv", 
-                       help="Output CSV file path (default: workorders.csv)")
-    parser.add_argument("--no-csv", action="store_true",
-                       help="Skip CSV export")
+    parser.add_argument("--output", default="workorders.xlsx", 
+                       help="Output file path (default: workorders.xlsx)")
+    parser.add_argument("--format", choices=["excel", "csv"], default="excel",
+                       help="Output format: excel or csv (default: excel)")
+    parser.add_argument("--no-export", action="store_true",
+                       help="Skip file export")
     
     args = parser.parse_args()
     
@@ -1959,79 +2215,114 @@ def main():
     # Print results
     print_work_orders(work_orders)
     
-    # Export to CSV by default (unless --no-csv is specified)
-    if not args.no_csv and work_orders:
-        export_to_csv(work_orders, args.csv)
-        print(f"\nWork orders exported to: {args.csv}")
+    # Export to file by default (unless --no-export is specified)
+    if not args.no_export and work_orders:
+        # Ensure output file has correct extension based on format
+        output_file = args.output
+        if args.format == "excel" and not output_file.endswith('.xlsx'):
+            output_file = output_file.rsplit('.', 1)[0] + '.xlsx'
+        elif args.format == "csv" and not output_file.endswith('.csv'):
+            output_file = output_file.rsplit('.', 1)[0] + '.csv'
+        
+        print(f"\n📊 Exporting work orders to {args.format.upper()} format...")
+        
+        # Remove existing file if it exists
+        if not safe_remove_file(output_file):
+            print("❌ Cannot proceed without removing the existing file.")
+            return 1
+        
+        # Export based on format
+        success = False
+        if args.format == "excel":
+            success = export_to_excel(work_orders, output_file)
+        else:  # csv
+            success = export_to_csv(work_orders, output_file)
+        
+        if success:
+            print(f"✅ Work orders exported successfully to: {output_file}")
+            
+            # Auto-open the file
+            print("📂 Opening file...")
+            if open_file(output_file):
+                print("✅ File opened successfully!")
+            else:
+                print("ℹ️  File saved but could not be auto-opened.")
+        else:
+            print("❌ Failed to export work orders.")
+            return 1
     elif not work_orders:
         print("\nNo work orders generated.")
     
     return 0
 
 
-def export_to_csv(work_orders: List[WorkOrder], csv_path: str) -> None:
-    """Export work orders to CSV with optimized disk writes."""
+def export_to_csv(work_orders: List[WorkOrder], csv_path: str) -> bool:
+    """Export work orders to CSV with safe file operations. Returns True if successful."""
     import csv
     
-    # Prepare all data in memory first to minimize disk writes
-    all_rows = []
-    
-    # Header
-    header = [
-        'work_order_id', 'plane_id', 'plane_registration', 'plane_type', 'priority',
-        'job_sequence', 'job_id', 'source', 'departure', 'destination', 'distance_nm',
-        'flight_hours', 'pay', 'xp', 'pay_per_hour', 'xp_per_hour', 'balance_score',
-        'time_remaining_hours', 'penalty_amount', 'adjusted_pay_per_hour', 'adjusted_pay_total',
-        'speed_kts', 'min_airport_size', 'route', 'legs_count',
-        'accumulated_hours', 'is_late', 'job_type', 'payload_lbs'
-    ]
-    all_rows.append(header)
-    
-    # Data
-    for wo_id, wo in enumerate(work_orders, 1):
-        accumulated_hours = 0.0
-        job_seq = 1
+    def write_csv_operation():
+        # Prepare all data in memory first to minimize disk writes
+        all_rows = []
         
-        # Export jobs and multi-job legs in execution order
-        for item_type, item in wo.execution_order:
-            if item_type == "job":
-                # Export regular job
-                job = item
-                accumulated_hours += job.flight_hours
-                is_late = accumulated_hours > job.time_remaining_hours
-                
-                all_rows.append([
-                    wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
-                    job_seq, job.job_id, job.source, job.departure, job.destination, job.distance_nm,
-                    job.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
-                    job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
-                    job.speed_kts, job.min_airport_size or "", job.route, job.legs_count,
-                    accumulated_hours, is_late, "single", job.total_payload_lbs
-                ])
-                job_seq += 1
-                
-            elif item_type == "multi_leg":
-                # Export multi-job leg
-                leg = item
-                accumulated_hours += leg.flight_hours
-                
-                for i, job in enumerate(leg.jobs, 1):
+        # Header
+        header = [
+            'work_order_id', 'plane_id', 'plane_registration', 'plane_type', 'priority',
+            'job_sequence', 'job_id', 'source', 'departure', 'destination', 'distance_nm',
+            'flight_hours', 'pay', 'xp', 'pay_per_hour', 'xp_per_hour', 'balance_score',
+            'time_remaining_hours', 'penalty_amount', 'adjusted_pay_per_hour', 'adjusted_pay_total',
+            'speed_kts', 'min_airport_size', 'route', 'legs_count',
+            'accumulated_hours', 'is_late', 'job_type', 'payload_lbs'
+        ]
+        all_rows.append(header)
+        
+        # Data
+        for wo_id, wo in enumerate(work_orders, 1):
+            accumulated_hours = 0.0
+            job_seq = 1
+            
+            # Export jobs and multi-job legs in execution order
+            for item_type, item in wo.execution_order:
+                if item_type == "job":
+                    # Export regular job
+                    job = item
+                    accumulated_hours += job.flight_hours
                     is_late = accumulated_hours > job.time_remaining_hours
                     
                     all_rows.append([
                         wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
-                        job_seq, job.job_id, job.source, leg.from_icao, leg.to_icao, leg.distance_nm,
-                        leg.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
+                        job_seq, job.job_id, job.source, job.departure, job.destination, job.distance_nm,
+                        job.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
                         job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
-                        leg.speed_kts, job.min_airport_size or "", f"{leg.from_icao} -> {leg.to_icao}", job.legs_count,
-                        accumulated_hours, is_late, f"multi_{i}/{len(leg.jobs)}", job.total_payload_lbs
+                        job.speed_kts, job.min_airport_size or "", job.route, job.legs_count,
+                        accumulated_hours, is_late, "single", job.total_payload_lbs
                     ])
-                job_seq += 1
+                    job_seq += 1
+                    
+                elif item_type == "multi_leg":
+                    # Export multi-job leg
+                    leg = item
+                    accumulated_hours += leg.flight_hours
+                    
+                    for i, job in enumerate(leg.jobs, 1):
+                        is_late = accumulated_hours > job.time_remaining_hours
+                        
+                        all_rows.append([
+                            wo_id, wo.plane_id, wo.plane_registration, wo.plane_type, wo.priority,
+                            job_seq, job.job_id, job.source, leg.from_icao, leg.to_icao, leg.distance_nm,
+                            leg.flight_hours, job.pay, job.xp, job.pay_per_hour, job.xp_per_hour, job.balance_score,
+                            job.time_remaining_hours, job.penalty_amount, job.adjusted_pay_per_hour, job.adjusted_pay_total,
+                            leg.speed_kts, job.min_airport_size or "", f"{leg.from_icao} -> {leg.to_icao}", job.legs_count,
+                            accumulated_hours, is_late, f"multi_{i}/{len(leg.jobs)}", job.total_payload_lbs
+                        ])
+                    job_seq += 1
+        
+        # Write all data in a single operation
+        with open(csv_path, 'w', newline='', encoding='utf-8', buffering=8192) as f:
+            writer = csv.writer(f)
+            writer.writerows(all_rows)
+        return True
     
-    # Write all data in a single operation
-    with open(csv_path, 'w', newline='', encoding='utf-8', buffering=8192) as f:
-        writer = csv.writer(f)
-        writer.writerows(all_rows)
+    return safe_file_operation(write_csv_operation, csv_path, "write CSV file")
 
 
 if __name__ == "__main__":
