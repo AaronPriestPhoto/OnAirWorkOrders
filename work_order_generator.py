@@ -855,20 +855,7 @@ class WorkOrderGenerator:
         
         hub_jobs = []
         
-        # Debug for BONE planes
-        if 'BONE' in plane.registration:
-            print(f"    DEBUG {plane.registration}: Checking {len(top_hubs)} top hubs")
-            for i, (hub_icao, job_count) in enumerate(top_hubs[:10]):  # Show top 10 hubs
-                if hub_icao == plane.current_location:
-                    continue
-                hub_jobs_for_this_hub = []
-                for job in plane.feasible_jobs:
-                    if job.job_id in self._used_jobs_tracking:
-                        continue
-                    if not job.legs or job.legs[0]['from_icao'].upper() != hub_icao.upper():
-                        continue
-                    hub_jobs_for_this_hub.append(job)
-                print(f"    DEBUG {plane.registration}: Hub {hub_icao} has {len(hub_jobs_for_this_hub)} available jobs")
+        # Debug-only printing removed
         
         for hub_icao, job_count in top_hubs:
             if hub_icao == plane.current_location:
@@ -1257,43 +1244,40 @@ class WorkOrderGenerator:
             
             # Debug output for first few planes and BONE planes
             if iteration_count == 0 and ('ANT' in plane.registration or 'BONE' in plane.registration or 'SKY' in plane.registration):
-                print(f"    DEBUG {plane.registration}: {len(multi_job_legs)} multi-job legs, {len(single_jobs)} single jobs available")
-                print(f"    DEBUG {plane.registration}: Jobs from current location: {len(jobs_from_current)}")
+                pass
                 
                 # Debug multi-job leg creation
                 if len(multi_job_legs) == 0 and len(jobs_from_current) > 1:
-                    print(f"    DEBUG {plane.registration}: No multi-job legs despite {len(jobs_from_current)} jobs from {current_location}")
+                    pass
                     # Show first few jobs and their legs
                     for i, job in enumerate(jobs_from_current[:3]):
                         if job.legs:
                             leg_info = f"{job.legs[0]['from_icao']} -> {job.legs[0]['to_icao']}"
-                            print(f"    DEBUG {plane.registration}: Job {i+1}: {leg_info}, payload: {job.total_payload_lbs:.0f}lbs")
+                            pass
                 
                 if single_jobs:
-                    print(f"    DEBUG {plane.registration}: Best single job score: {work_order.get_priority_score(single_jobs[0]):.2f}")
+                    pass
                 if multi_job_legs:
                     best_leg = max(multi_job_legs, key=lambda leg: sum(job.pay + job.xp for job in leg.jobs) / leg.flight_hours)
-                    print(f"    DEBUG {plane.registration}: Best multi-job leg: {len(best_leg.jobs)} jobs, {sum(job.pay + job.xp for job in best_leg.jobs) / best_leg.flight_hours:.2f} efficiency")
+                    pass
                     
                     # Additional debug for BONE planes
                     if 'BONE' in plane.registration:
-                        print(f"    DEBUG {plane.registration}: Current location: {current_location}")
-                        print(f"    DEBUG {plane.registration}: Remaining hours: {remaining_hours:.2f}")
+                        pass
                         if jobs_from_current:
                             first_job = jobs_from_current[0]
-                            print(f"    DEBUG {plane.registration}: First job flight hours: {first_job.flight_hours:.2f}")
-                            print(f"    DEBUG {plane.registration}: Job fits time: {first_job.flight_hours <= (remaining_hours + 0.5)}")
+                            pass
                     
                     # Additional debug for SKYLABS planes - focus on XP
                     if 'SKY' in plane.registration:
-                        print(f"    DEBUG {plane.registration}: SKYLABS - Looking for high-XP jobs")
+                        pass
                         best_leg_xp = sum(job.xp for job in best_leg.jobs)
                         best_leg_pay = sum(job.pay for job in best_leg.jobs)
-                        print(f"    DEBUG {plane.registration}: Best multi-job leg XP: {best_leg_xp}, Pay: ${best_leg_pay:,.0f}")
+                        pass
                         
                         # Show top 5 multi-leg jobs by XP
                         if multi_job_legs:
-                            print(f"    DEBUG {plane.registration}: Top 5 multi-leg jobs by XP:")
+                            pass
                             sorted_multi = sorted(multi_job_legs, key=lambda x: sum(job.xp for job in x.jobs), reverse=True)[:5]
                             for i, job in enumerate(sorted_multi, 1):
                                 job_xp = sum(j.xp for j in job.jobs)
@@ -1302,7 +1286,7 @@ class WorkOrderGenerator:
                         
                         # Show top 5 single jobs by XP
                         if single_jobs:
-                            print(f"    DEBUG {plane.registration}: Top 5 single jobs by XP:")
+                            pass
                             sorted_single = sorted(single_jobs, key=lambda x: x.xp, reverse=True)[:5]
                             for i, job in enumerate(sorted_single, 1):
                                 print(f"      {i}. {job.xp} XP, ${job.pay:,.0f} pay, {work_order.get_priority_score(job):.2f} score")
@@ -1356,7 +1340,7 @@ class WorkOrderGenerator:
             if best_option and best_type == "multi_job":
                 # Debug: Show multi-job leg selection
                 if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
-                    print(f"    DEBUG {plane.registration}: Selected multi-job leg from {best_option.from_icao} to {best_option.to_icao} (current: {current_location})")
+                    pass
                 
                 # Add the multi-job leg
                 work_order.add_multi_job_leg(best_option)
@@ -1373,7 +1357,7 @@ class WorkOrderGenerator:
             elif best_option and best_type == "single_job":
                 # Debug: Show single job selection
                 if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
-                    print(f"    DEBUG {plane.registration}: Selected single job from {best_option.legs[0]['from_icao']} to {best_option.destination} (current: {current_location})")
+                    pass
                 
                 # Add the single job
                 work_order.add_job(best_option, work_order.total_hours)
@@ -1390,9 +1374,8 @@ class WorkOrderGenerator:
                 all_available_jobs = [job for job in plane.feasible_jobs if job.job_id not in self._used_jobs_tracking]
                 
                 # Debug output for planes having issues
-                if iteration_count == 0 and ('ANT' in plane.registration or 'BONE' in plane.registration):
-                    print(f"    DEBUG {plane.registration}: Available jobs anywhere: {len(all_available_jobs)}")
-                    print(f"    DEBUG {plane.registration}: Best local efficiency: {best_efficiency_score:.2f}")
+            if iteration_count == 0 and ('ANT' in plane.registration or 'BONE' in plane.registration):
+                pass
                 
                 if all_available_jobs:
                     # Find the best job from anywhere that helps build the most efficient work order
@@ -1423,7 +1406,7 @@ class WorkOrderGenerator:
                     # Debug remote job selection
                     if 'BONE' in plane.registration and best_remote_job:
                         transit_efficiency = best_remote_job.flight_hours / (best_remote_job.flight_hours + best_remote_job.hub_penalty_hours)
-                        print(f"    DEBUG {plane.registration}: Remote job efficiency: {best_remote_score:.2f}, transit_eff={transit_efficiency:.3f}")
+                        pass
                     
                     if best_remote_job:
                         # Calculate actual distance for transit leg
@@ -1472,7 +1455,7 @@ class WorkOrderGenerator:
                         # Now add the actual remote job
                         # Debug: Show remote job selection
                         if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
-                            print(f"    DEBUG {plane.registration}: Added remote job from {best_remote_job.legs[0]['from_icao']} to {best_remote_job.destination} with transit leg")
+                            pass
                         
                         work_order.add_job(best_remote_job, work_order.total_hours)
                         self._used_jobs_tracking.add(best_remote_job.job_id)
@@ -1483,7 +1466,7 @@ class WorkOrderGenerator:
             
             # No more options available
             if 'ANT' in plane.registration:
-                print(f"    DEBUG {plane.registration}: No more options found. Remaining hours: {remaining_hours:.2f}")
+                pass
             break
         
         # Second pass: try to fill remaining time with smaller jobs (more aggressive)
@@ -1493,7 +1476,7 @@ class WorkOrderGenerator:
             
             # Debug: Show second pass optimization
             if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
-                print(f"    DEBUG {plane.registration}: Starting second pass optimization from {actual_current_location} with {remaining_hours:.2f} hours remaining")
+                pass
             
             self._optimize_work_order_second_pass_simple(work_order, plane, actual_current_location, 
                                                         max_hours, epsilon_hours)
@@ -1505,8 +1488,7 @@ class WorkOrderGenerator:
         if len(work_order.jobs) > 1:
             # Debug: Show job order before optimization
             if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
-                print(f"    DEBUG {plane.registration}: Job order before optimization:")
-                print(f"      Regular jobs: {len(work_order.jobs)}")
+                pass
                 for i, job in enumerate(work_order.jobs):
                     if hasattr(job, 'legs') and job.legs:
                         from_loc = job.legs[0]['from_icao']
@@ -1518,13 +1500,11 @@ class WorkOrderGenerator:
             
             # Apply penalty optimization unless disabled
             if self.enable_penalty_optimization:
-                print(f"    DEBUG: Starting penalty optimization for {len(work_order.jobs)} jobs")
                 self._optimize_job_order_for_penalties(work_order)
-                print(f"    DEBUG: After penalty optimization: {len(work_order.jobs)} jobs")
             
             # Debug: Show job order after optimization
             if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
-                print(f"    DEBUG {plane.registration}: Job order after optimization:")
+                pass
                 for i, job in enumerate(work_order.jobs):
                     if hasattr(job, 'legs') and job.legs:
                         from_loc = job.legs[0]['from_icao']
@@ -1612,7 +1592,7 @@ class WorkOrderGenerator:
             if best_job:
                 # Debug: Show second pass job selection
                 if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
-                    print(f"    DEBUG {plane.registration}: Second pass added job from {best_job.legs[0]['from_icao']} to {best_job.destination} (current: {current_location})")
+                    pass
                 
                 # Add the job
                 work_order.add_job(best_job, work_order.total_hours)
@@ -1631,7 +1611,7 @@ class WorkOrderGenerator:
         
         # Debug: Show jobs before removing trailing transit legs
         if 'ANT-07' in str(work_order.jobs[0].job_id if work_order.jobs else ''):
-            print(f"    DEBUG: Before removing trailing transit legs: {len(work_order.jobs)} jobs")
+            pass
             for i, job in enumerate(work_order.jobs):
                 if hasattr(job, 'legs') and job.legs:
                     from_loc = job.legs[0]['from_icao']
@@ -1651,7 +1631,7 @@ class WorkOrderGenerator:
         
         # Debug: Show jobs after removing trailing transit legs
         if 'ANT-07' in str(work_order.jobs[0].job_id if work_order.jobs else '') and removed_count > 0:
-            print(f"    DEBUG: Removed {removed_count} trailing transit legs: {len(work_order.jobs)} jobs remaining")
+            pass
             for i, job in enumerate(work_order.jobs):
                 if hasattr(job, 'legs') and job.legs:
                     from_loc = job.legs[0]['from_icao']
@@ -1704,14 +1684,14 @@ class WorkOrderGenerator:
         if len(work_order.jobs) <= 1:
             return
         
-        print(f"    DEBUG: Starting penalty optimization for {len(work_order.jobs)} jobs")
+        pass
         
         # Group consecutive jobs by departure/destination
         groups = []
         current_group = [work_order.jobs[0]]
         
         # Debug: Show job grouping process
-        print(f"    DEBUG: Starting job grouping for {len(work_order.jobs)} jobs")
+        pass
         for i, job in enumerate(work_order.jobs):
             # Use consistent departure/destination logic
             from_loc = job.legs[0]['from_icao'] if job.legs else job.departure
@@ -1731,25 +1711,25 @@ class WorkOrderGenerator:
             # Check if jobs have same departure and destination
             if prev_from == curr_from and prev_to == curr_to:
                 current_group.append(curr_job)
-                print(f"    DEBUG: Added job {i+1} to group (same route: {curr_from} -> {curr_to})")
+                pass
             else:
                 # End current group and start new one
                 if len(current_group) > 1:
                     groups.append(current_group)
-                    print(f"    DEBUG: Closed group with {len(current_group)} jobs")
+                    pass
                 current_group = [curr_job]
-                print(f"    DEBUG: Started new group with job {i+1} (route: {curr_from} -> {curr_to})")
+                pass
         
         # Add the last group if it has multiple jobs
         if len(current_group) > 1:
             groups.append(current_group)
         
         # Debug: Show groups found
-        print(f"    DEBUG: Found {len(groups)} groups with multiple jobs")
+        pass
         
         # Sort each group by time remaining (ascending = most urgent first)
         for i, group in enumerate(groups):
-            print(f"    DEBUG: Sorting group {i+1} with {len(group)} jobs by time remaining")
+            pass
             original_order = [f"{j.job_id[:8]}...({j.time_remaining_hours:.1f}h)" for j in group]
             group.sort(key=lambda j: j.time_remaining_hours)
             sorted_order = [f"{j.job_id[:8]}...({j.time_remaining_hours:.1f}h)" for j in group]
@@ -1760,13 +1740,13 @@ class WorkOrderGenerator:
         new_jobs = []
         
         # Debug: Show what groups were found
-        print(f"    DEBUG: Found {len(groups)} groups to sort")
+        pass
         for i, group in enumerate(groups):
             print(f"      Group {i}: {len(group)} jobs")
         
         # CONSERVATIVE APPROACH: Rebuild the job list with sorted groups in correct order
         if groups:
-            print(f"    DEBUG: Reordering {len(groups)} groups of jobs")
+            pass
             
             # Create a mapping from job_id to which group it belongs to
             job_to_group = {}
@@ -1784,7 +1764,7 @@ class WorkOrderGenerator:
                     # This job is part of a group - add the entire sorted group
                     group = job_to_group[job.job_id]
                     new_jobs.extend(group)
-                    print(f"    DEBUG: Added sorted group of {len(group)} jobs")
+                    pass
                     
                     # Skip all other jobs in this group
                     for other_job in group:
@@ -1798,10 +1778,10 @@ class WorkOrderGenerator:
             
             # Replace the work order jobs with the reordered list
             work_order.jobs = new_jobs
-            print(f"    DEBUG: Rebuilt job list with sorted groups")
+            pass
         
         # Debug: Show final job count (should be unchanged)
-        print(f"    DEBUG: Final job count: {len(work_order.jobs)} jobs (should be unchanged)")
+        pass
         
         # Recalculate totals and penalties with correct accumulated times after reordering
         self._recalculate_work_order_totals(work_order)
@@ -1885,15 +1865,15 @@ class WorkOrderGenerator:
             
             # Debug for Concorde and Lancer planes
             if plane.plane_type in ['Concorde', 'Rockwell B-1 Lancer']:
-                print(f"  DEBUG {plane.registration}: Total feasible jobs: {len(plane.feasible_jobs)}")
+                pass
                 if plane.feasible_jobs:
                     # Show first few jobs and their locations
                     for j, job in enumerate(plane.feasible_jobs[:3]):
                         if job.legs:
                             leg_info = f"{job.legs[0]['from_icao']} -> {job.destination}"
-                            print(f"  DEBUG {plane.registration}: Job {j+1}: {leg_info}, pay: ${job.pay:,.0f}, hours: {job.flight_hours:.1f}h")
+                            pass
                 else:
-                    print(f"  DEBUG {plane.registration}: No feasible jobs found - checking why...")
+                    pass
                     # Check if there are ANY jobs in the database for this plane type
                     with db_mod.connect(self.db_path) as conn:
                         total_jobs = conn.execute("""
@@ -1906,7 +1886,7 @@ class WorkOrderGenerator:
                             JOIN jobs j ON j.id = js.job_id 
                             WHERE js.plane_id = ? AND js.feasible = 1
                         """, (plane.plane_id,)).fetchone()
-                        print(f"  DEBUG {plane.registration}: Total jobs scored: {total_jobs[0]}, Feasible: {feasible_jobs[0]}")
+                        pass
             
             if not plane.feasible_jobs:
                 print(f"  No feasible jobs found for {plane.registration}")
@@ -1949,28 +1929,24 @@ class WorkOrderGenerator:
                     print(f"  Work order ends with transit job for {plane.registration} (rejected)")
                 # Debug: Check what happened for PANO and BONE planes
                 if 'PANO' in plane.registration or 'BONE' in plane.registration:
-                    print(f"    DEBUG: {plane.registration} - Feasible jobs: {len(plane.feasible_jobs)}")
-                    print(f"    DEBUG: {plane.registration} - Used jobs count: {len(self._used_jobs_tracking)}")
+                    pass
                     if plane.feasible_jobs:
                         available_jobs = [job for job in plane.feasible_jobs if job.job_id not in self._used_jobs_tracking]
-                        print(f"    DEBUG: {plane.registration} - Available jobs: {len(available_jobs)}")
+                        pass
                         if available_jobs:
-                            print(f"    DEBUG: {plane.registration} - First available job: {available_jobs[0].job_id}")
+                            pass
                             
                         # Debug work order details
-                        print(f"    DEBUG: {plane.registration} - Work order jobs: {len(work_order.jobs)}")
-                        print(f"    DEBUG: {plane.registration} - Work order multi-job legs: {len(work_order.multi_job_legs)}")
+                        pass
                         if work_order.jobs:
-                            print(f"    DEBUG: {plane.registration} - Work order total hours: {work_order.total_hours:.2f}")
-                            print(f"    DEBUG: {plane.registration} - Has profitable jobs: {has_profitable_jobs}")
-                            print(f"    DEBUG: {plane.registration} - Ends with transit: {ends_with_transit}")
+                            pass
                             if work_order.jobs:
                                 last_job = work_order.jobs[-1]
-                                print(f"    DEBUG: {plane.registration} - Last job source: {last_job.source}, pay: {last_job.pay}, xp: {last_job.xp}")
+                                pass
                         else:
-                            print(f"    DEBUG: {plane.registration} - All jobs already used")
+                            pass
                     else:
-                        print(f"    DEBUG: {plane.registration} - No feasible jobs")
+                        pass
         
         # Write used jobs to database only once at the end
         self.write_used_jobs_to_database()
