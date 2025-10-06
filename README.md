@@ -35,9 +35,13 @@ The app will read configuration via `onair/config.py`.
   - A backup may be created as `onair_jobs.db.backup` during certain operations
 
 ### Typical Workflow
+
+Quick start:
+- Simply run `python fetch_jobs.py`. By default it runs in ONLINE mode, fetches/caches data, scores jobs, and generates/exports work orders automatically. You only need to run individual scripts separately if you want finer control.
+
 1) Fetch and cache data (ONLINE)
 ```bash
-python fetch_jobs.py --mode online
+python fetch_jobs.py
 ```
 This will:
 - Clear previous data
@@ -57,7 +61,7 @@ This will:
 - Score jobs
 - Optionally generate work orders
 
-3) Generate work orders manually
+3) Generate work orders manually (optional; not needed for the quick start)
 ```bash
 python work_order_generator.py --format excel --output workorders.xlsx
 # or CSV
@@ -106,6 +110,6 @@ If present, `planes.xlsx` may include a `Jobs` sheet used by the performance opt
 - If airport cache is stale, airports will be refetched based on `AIRPORT_CACHE_DAYS`.
 
 ### License
-MIT (or your preferred license). Add a `LICENSE` file if needed.
+This project is licensed under the MIT License. See `LICENSE` for details.
 
 
