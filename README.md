@@ -25,7 +25,7 @@ ONAIR_API_KEY=your_api_key_here
 ONAIR_COMPANY_ID=your_company_id_here
 RUN_MODE=online  # or offline
 DB_PATH=onair_jobs.db
-AIRPORT_CACHE_DAYS=14
+AIRPORT_CACHE_DAYS=90
 ```
 The app will read configuration via `onair/config.py`.
 
