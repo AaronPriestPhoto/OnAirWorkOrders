@@ -1797,27 +1797,32 @@ class WorkOrderGenerator:
         # Create a mapping from job_id to the reordered job object
         job_map = {job.job_id: job for job in work_order.jobs}
         
-        # Build new execution order maintaining multi-job leg positions
+        # Build new execution order from the reordered jobs list
+        # We need to maintain multi-job leg positions while inserting reordered single jobs
         new_execution_order = []
         jobs_added = set()
+        multi_leg_map = {}
         
+        # First, identify which jobs belong to multi-job legs and their positions
         for item_type, item in work_order.execution_order:
             if item_type == "multi_leg":
-                # Keep multi-job leg in its original position
-                new_execution_order.append(("multi_leg", item))
-            elif item_type == "job":
-                # Replace with reordered job if it still exists
-                job_id = item.job_id
-                if job_id in job_map and job_id not in jobs_added:
-                    new_execution_order.append(("job", job_map[job_id]))
-                    jobs_added.add(job_id)
+                for job in item.jobs:
+                    multi_leg_map[job.job_id] = item
         
-        # Add any jobs that weren't in the original execution_order
-        # (shouldn't happen, but be defensive)
+        # Now build the new execution order using the reordered jobs list
         for job in work_order.jobs:
-            if job.job_id not in jobs_added:
-                new_execution_order.append(("job", job))
-                jobs_added.add(job.job_id)
+            if job.job_id in multi_leg_map:
+                # This job is part of a multi-leg
+                leg = multi_leg_map[job.job_id]
+                if leg not in [item for _, item in new_execution_order if _ == "multi_leg"]:
+                    # Add the multi-leg only once (first time we encounter any job from it)
+                    new_execution_order.append(("multi_leg", leg))
+                    jobs_added.update(j.job_id for j in leg.jobs)
+            else:
+                # Single job - add it in the reordered position
+                if job.job_id not in jobs_added:
+                    new_execution_order.append(("job", job))
+                    jobs_added.add(job.job_id)
         
         work_order.execution_order = new_execution_order
         
