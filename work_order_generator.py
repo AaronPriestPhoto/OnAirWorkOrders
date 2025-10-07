@@ -1793,36 +1793,59 @@ class WorkOrderGenerator:
         work_order.total_xp = 0.0
         work_order.total_adjusted_pay = 0.0
         
-        # Rebuild execution_order to match the new job order
-        work_order.execution_order = []
+        # Rebuild execution_order preserving the positions of multi-job legs
+        # Create a mapping from job_id to the reordered job object
+        job_map = {job.job_id: job for job in work_order.jobs}
         
-        accumulated_hours = 0.0
+        # Build new execution order maintaining multi-job leg positions
+        new_execution_order = []
+        jobs_added = set()
+        
+        for item_type, item in work_order.execution_order:
+            if item_type == "multi_leg":
+                # Keep multi-job leg in its original position
+                new_execution_order.append(("multi_leg", item))
+            elif item_type == "job":
+                # Replace with reordered job if it still exists
+                job_id = item.job_id
+                if job_id in job_map and job_id not in jobs_added:
+                    new_execution_order.append(("job", job_map[job_id]))
+                    jobs_added.add(job_id)
+        
+        # Add any jobs that weren't in the original execution_order
+        # (shouldn't happen, but be defensive)
         for job in work_order.jobs:
-            accumulated_hours += job.flight_hours
-            
-            # Recalculate penalty based on new position
-            job.penalty_amount = work_order._calculate_penalty(job, accumulated_hours)
-            job.adjusted_pay_total = job.pay - job.penalty_amount
-            job.adjusted_pay_per_hour = job.adjusted_pay_total / job.flight_hours if job.flight_hours > 0 else 0.0
-            
-            work_order.total_hours += job.flight_hours
-            work_order.total_pay += job.pay
-            work_order.total_xp += job.xp
-            work_order.total_adjusted_pay += job.adjusted_pay_total
-            
-            # Add job to execution order in new position
-            work_order.execution_order.append(("job", job))
+            if job.job_id not in jobs_added:
+                new_execution_order.append(("job", job))
+                jobs_added.add(job.job_id)
         
-        # Also include multi-job legs in totals and execution order
-        for leg in work_order.multi_job_legs:
-            work_order.total_hours += leg.flight_hours
-            for job in leg.jobs:
+        work_order.execution_order = new_execution_order
+        
+        # Recalculate totals and penalties in execution order
+        accumulated_hours = 0.0
+        for item_type, item in work_order.execution_order:
+            if item_type == "job":
+                job = item
+                accumulated_hours += job.flight_hours
+                
+                # Recalculate penalty based on new position
+                job.penalty_amount = work_order._calculate_penalty(job, accumulated_hours)
+                job.adjusted_pay_total = job.pay - job.penalty_amount
+                job.adjusted_pay_per_hour = job.adjusted_pay_total / job.flight_hours if job.flight_hours > 0 else 0.0
+                
+                work_order.total_hours += job.flight_hours
                 work_order.total_pay += job.pay
                 work_order.total_xp += job.xp
                 work_order.total_adjusted_pay += job.adjusted_pay_total
-            
-            # Add multi-job leg to execution order
-            work_order.execution_order.append(("multi_leg", leg))
+                
+            elif item_type == "multi_leg":
+                leg = item
+                accumulated_hours += leg.flight_hours
+                work_order.total_hours += leg.flight_hours
+                for job in leg.jobs:
+                    work_order.total_pay += job.pay
+                    work_order.total_xp += job.xp
+                    work_order.total_adjusted_pay += job.adjusted_pay_total
     
     def generate_all_work_orders(self, max_hours: float = 24.0, 
                                 epsilon_hours: float = 0.5) -> List[WorkOrder]:
