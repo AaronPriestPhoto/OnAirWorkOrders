@@ -968,27 +968,26 @@ class WorkOrderGenerator:
         best_combination = []
         best_profit = 0
         total_payload = 0
-        total_time = 0
+        # For multi-job legs, all jobs share the same flight time (parallel, not sequential)
+        flight_time = sorted_jobs[0].flight_hours if sorted_jobs else 0
+        
+        # Check if the single flight time fits within remaining hours
+        if flight_time > remaining_hours:
+            return None  # The route itself is too long
         
         # Try adding jobs one by one, starting with the most efficient
         for job in sorted_jobs:
             # Check if adding this job would exceed limits
             new_total_payload = total_payload + job.total_payload_lbs
-            new_total_time = total_time + job.flight_hours
             
             # Check payload capacity for this distance
             max_payload = self._calculate_payload_range_limit(plane_spec, distance)
             if new_total_payload > max_payload:
                 continue  # Skip this job - would exceed payload capacity
             
-            # Check time limits
-            if new_total_time > remaining_hours:
-                continue  # Skip this job - would exceed time limit
-            
             # Add this job to the combination
             best_combination.append(job)
             total_payload = new_total_payload
-            total_time = new_total_time
             best_profit += job.pay + job.xp
         
         # Return the combination if it has multiple jobs and is profitable
