@@ -2088,20 +2088,7 @@ def format_excel_workbook(wb, ws):
     try:
         from openpyxl.utils import get_column_letter
         
-        # Auto-size columns based on content
-        for col in range(1, ws.max_column + 1):
-            column_letter = get_column_letter(col)
-            max_length = 0
-            
-            for row in range(1, ws.max_row + 1):
-                cell_value = str(ws.cell(row=row, column=col).value or "")
-                max_length = max(max_length, len(cell_value))
-            
-            # Set reasonable column widths
-            adjusted_width = min(max_length + 2, 30)
-            ws.column_dimensions[column_letter].width = adjusted_width
-        
-        # Format specific columns for better readability using header names
+        # Format specific columns for better readability using header names (do this first)
         header_to_index = {}
         for col in range(1, ws.max_column + 1):
             name = (ws.cell(row=1, column=col).value or '').strip()
@@ -2116,6 +2103,36 @@ def format_excel_workbook(wb, ws):
                     cell = ws.cell(row=row, column=col)
                     if cell.value is not None:
                         cell.number_format = '#,##0.00'
+        
+        # Auto-size columns based on content (after formatting is applied)
+        for col in range(1, ws.max_column + 1):
+            column_letter = get_column_letter(col)
+            column_name = (ws.cell(row=1, column=col).value or '').strip()
+            max_length = 0
+            
+            for row in range(1, ws.max_row + 1):
+                cell = ws.cell(row=row, column=col)
+                cell_value = str(cell.value or "")
+                
+                # For currency columns, estimate formatted width (add space for commas and decimals)
+                if column_name in ['pay', 'pay_per_hour', 'adjusted_pay_per_hour', 'adjusted_pay_total']:
+                    if cell.value and isinstance(cell.value, (int, float)):
+                        # Estimate: every 3 digits adds a comma, plus 3 chars for ".00"
+                        num_digits = len(str(int(abs(cell.value))))
+                        num_commas = max(0, (num_digits - 1) // 3)
+                        estimated_width = num_digits + num_commas + 3  # +3 for ".00"
+                        max_length = max(max_length, estimated_width)
+                    else:
+                        max_length = max(max_length, len(cell_value))
+                else:
+                    max_length = max(max_length, len(cell_value))
+            
+            # Set reasonable column widths with slightly more padding for currency
+            if column_name in ['pay', 'pay_per_hour', 'adjusted_pay_per_hour', 'adjusted_pay_total']:
+                adjusted_width = min(max_length + 3, 18)  # Extra padding for currency, max 18
+            else:
+                adjusted_width = min(max_length + 2, 30)
+            ws.column_dimensions[column_letter].width = adjusted_width
 
         # One decimal place
         for name in ['xp', 'distance_nm', 'time_remaining_hours']:
