@@ -1374,8 +1374,8 @@ class WorkOrderGenerator:
                 all_available_jobs = [job for job in plane.feasible_jobs if job.job_id not in self._used_jobs_tracking]
                 
                 # Debug output for planes having issues
-            if iteration_count == 0 and ('ANT' in plane.registration or 'BONE' in plane.registration):
-                pass
+                if iteration_count == 0 and ('ANT' in plane.registration or 'BONE' in plane.registration):
+                    pass
                 
                 if all_available_jobs:
                     # Find the best job from anywhere that helps build the most efficient work order

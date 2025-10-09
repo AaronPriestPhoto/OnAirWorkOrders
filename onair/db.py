@@ -337,7 +337,13 @@ def upsert_airplanes(db_path: str, airplanes: Iterable[Dict[str, Any]]) -> int:
 			)
 			aircraft_icao = _safe_get(ap, "AircraftTypeICAO") or _safe_get(ap, "icao")
 			status = _safe_get(ap, "State") or _safe_get(ap, "Status") or _safe_get(ap, "state")
-			loc = _safe_get(ap, "CurrentAirportICAO") or _safe_get(ap, "LocationICAO") or _safe_get(ap, "location_icao")
+			# Try to get location from various possible fields, including nested CurrentAirport.ICAO
+			loc = (
+				_safe_get(ap, "CurrentAirportICAO") or 
+				_safe_get(ap, "LocationICAO") or 
+				_safe_get(ap, "location_icao") or
+				_safe_get(ap.get("CurrentAirport", {}), "ICAO")
+			)
 			lat = _safe_get(ap, "Latitude") or _safe_get(ap, "latitude")
 			lon = _safe_get(ap, "Longitude") or _safe_get(ap, "longitude")
 			fuel_total = _safe_get(ap, "FuelTotalQuantity") or _safe_get(ap, "fuel_total")
