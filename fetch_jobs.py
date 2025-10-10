@@ -202,10 +202,20 @@ def main():
 			print("Generating work orders...")
 			from work_order_generator import WorkOrderGenerator, PerformanceOptimizer, export_to_excel, open_file
 			from onair.config import load_config as load_wo_config
+			import os
 			
 			# Initialize components
 			wo_config = load_wo_config()
+			
+			# Initialize performance optimizer and load sample data
 			optimizer = PerformanceOptimizer(wo_config.db_path)
+			excel_path = os.path.join(os.path.dirname(__file__), 'planes.xlsx')
+			if os.path.exists(excel_path):
+				print("Loading performance optimization data...")
+				optimizer.load_and_process(excel_path)
+			else:
+				print("No performance optimization data found (planes.xlsx), using default calculations")
+				optimizer = None
 			
 			# Generate work orders with default settings (penalty optimization enabled)
 			generator = WorkOrderGenerator(wo_config.db_path, optimizer, enable_penalty_optimization=True)
@@ -389,10 +399,20 @@ def main():
 		print("Generating work orders...")
 		from work_order_generator import WorkOrderGenerator, PerformanceOptimizer, export_to_excel, open_file
 		from onair.config import load_config as load_wo_config
+		import os
 		
 		# Initialize components
 		wo_config = load_wo_config()
+		
+		# Initialize performance optimizer and load sample data
 		optimizer = PerformanceOptimizer(wo_config.db_path)
+		excel_path = os.path.join(os.path.dirname(__file__), 'planes.xlsx')
+		if os.path.exists(excel_path):
+			print("Loading performance optimization data...")
+			optimizer.load_and_process(excel_path)
+		else:
+			print("No performance optimization data found (planes.xlsx), using default calculations")
+			optimizer = None
 		
 		# Generate work orders with default settings (penalty optimization enabled)
 		generator = WorkOrderGenerator(wo_config.db_path, optimizer, enable_penalty_optimization=True)

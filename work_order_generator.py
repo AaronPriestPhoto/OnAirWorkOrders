@@ -272,11 +272,14 @@ class WorkOrder:
     
     def get_current_location(self) -> str:
         """Get the current location after all jobs in the work order."""
-        # Check multi-job legs first (they come after regular jobs)
-        if self.multi_job_legs:
-            return self.multi_job_legs[-1].to_icao
-        elif self.jobs:
-            return self.jobs[-1].destination
+        # Use execution_order to get the true current location
+        # This correctly handles interleaved jobs and multi-job legs
+        if self.execution_order:
+            item_type, item = self.execution_order[-1]
+            if item_type == "job":
+                return item.destination
+            elif item_type == "multi_leg":
+                return item.to_icao
         return ""
     
     def can_add_job(self, job: JobInfo, max_hours: float, epsilon_hours: float = 0.5) -> bool:
@@ -382,6 +385,20 @@ class WorkOrderGenerator:
         
         print(f"Database loaded into RAM at: {self._ram_db_path}")
     
+    def __del__(self):
+        """Cleanup: Remove temporary RAM database if it exists."""
+        if hasattr(self, '_ram_db_path') and self._ram_db_path != self.original_db_path:
+            if os.path.exists(self._ram_db_path):
+                try:
+                    os.unlink(self._ram_db_path)
+                    # Also clean up WAL/SHM files
+                    for ext in ['-wal', '-shm']:
+                        temp_file = f"{self._ram_db_path}{ext}"
+                        if os.path.exists(temp_file):
+                            os.unlink(temp_file)
+                except Exception:
+                    pass  # Ignore cleanup errors during destruction
+    
     @property
     def db_path(self) -> str:
         """Get the current database path (RAM database during processing)."""
@@ -396,9 +413,26 @@ class WorkOrderGenerator:
         os.close(temp_fd)  # Close the file descriptor, we'll use the path
         
         try:
+            # IMPORTANT: Checkpoint WAL before copying to ensure all changes are in the main DB file
+            # This prevents corruption when copying a SQLite database in WAL mode
+            with db_mod.connect(self.original_db_path) as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.commit()
+            
             # Copy the original database to the temporary location
             # Use copyfile instead of copy2 to avoid copying metadata
             shutil.copyfile(self.original_db_path, temp_path)
+            
+            # Also copy WAL and SHM files if they exist (belt-and-suspenders approach)
+            for ext in ['-wal', '-shm']:
+                src_file = f"{self.original_db_path}{ext}"
+                if os.path.exists(src_file):
+                    dest_file = f"{temp_path}{ext}"
+                    try:
+                        shutil.copyfile(src_file, dest_file)
+                    except Exception:
+                        pass  # WAL/SHM files might not exist after checkpoint
+            
             print(f"Database copied to RAM: {temp_path}")
             return temp_path
         except Exception as e:
@@ -423,8 +457,15 @@ class WorkOrderGenerator:
             shutil.copyfile(self._ram_db_path, self.original_db_path)
             print(f"Saved RAM database to: {self.original_db_path}")
             
-            # Clean up the temporary RAM database
+            # Clean up the temporary RAM database and its WAL/SHM files
             os.unlink(self._ram_db_path)
+            for ext in ['-wal', '-shm']:
+                temp_file = f"{self._ram_db_path}{ext}"
+                if os.path.exists(temp_file):
+                    try:
+                        os.unlink(temp_file)
+                    except Exception:
+                        pass  # Ignore errors cleaning up WAL/SHM files
             print("Cleaned up RAM database")
             
         except Exception as e:
@@ -1338,8 +1379,8 @@ class WorkOrderGenerator:
             # Add the best option
             if best_option and best_type == "multi_job":
                 # Debug: Show multi-job leg selection
-                if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
-                    pass
+                if 'SKY' in plane.registration or 'HERC' in plane.registration:
+                    print(f"      Main loop adding MULTI-LEG: {best_option.from_icao} -> {best_option.to_icao} ({len(best_option.jobs)} jobs)")
                 
                 # Add the multi-job leg
                 work_order.add_multi_job_leg(best_option)
@@ -1355,8 +1396,10 @@ class WorkOrderGenerator:
                 continue
             elif best_option and best_type == "single_job":
                 # Debug: Show single job selection
-                if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
-                    pass
+                if 'SKY' in plane.registration or 'HERC' in plane.registration:
+                    job_start = best_option.legs[0]['from_icao'] if best_option.legs else best_option.departure
+                    actual_loc = work_order.get_current_location() if work_order.jobs or work_order.multi_job_legs else plane.current_location
+                    print(f"      Main loop adding job: {job_start} -> {best_option.destination} (current_location var: {current_location}, actual: {actual_loc})")
                 
                 # Add the single job
                 work_order.add_job(best_option, work_order.total_hours)
@@ -1447,14 +1490,17 @@ class WorkOrderGenerator:
                             legs=[]  # Empty legs for transit jobs
                         )
                         
+                        if 'SKY' in plane.registration or 'HERC' in plane.registration:
+                            print(f"      Adding TRANSIT: {transit_job.departure} -> {transit_job.destination}")
+                        
                         work_order.add_job(transit_job, work_order.total_hours)
                         current_location = best_remote_job.legs[0]['from_icao']
                         remaining_hours = max_hours - work_order.total_hours
                         
                         # Now add the actual remote job
                         # Debug: Show remote job selection
-                        if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
-                            pass
+                        if 'SKY' in plane.registration or 'HERC' in plane.registration:
+                            print(f"      Adding REMOTE job: {best_remote_job.departure} -> {best_remote_job.destination}")
                         
                         work_order.add_job(best_remote_job, work_order.total_hours)
                         self._used_jobs_tracking.add(best_remote_job.job_id)
@@ -1486,6 +1532,14 @@ class WorkOrderGenerator:
         # Optimize job order to minimize penalties while preserving chaining
         if len(work_order.jobs) > 1:
             # Debug: Show job order before optimization
+            if 'SKY' in plane.registration or 'HERC' in plane.registration:
+                print(f"      Before penalty optimization:")
+                for i, (item_type, item) in enumerate(work_order.execution_order):
+                    if item_type == "job":
+                        print(f"        {i+1}. JOB: {item.departure} -> {item.destination} ({item.source})")
+                    else:
+                        print(f"        {i+1}. MULTI-LEG: {item.from_icao} -> {item.to_icao}")
+            
             if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
                 pass
                 for i, job in enumerate(work_order.jobs):
@@ -1590,8 +1644,17 @@ class WorkOrderGenerator:
             
             if best_job:
                 # Debug: Show second pass job selection
-                if 'ANT-07' in plane.registration or 'ANT-08' in plane.registration or 'ANT-06' in plane.registration:
-                    pass
+                if 'SKY' in plane.registration or 'HERC' in plane.registration:
+                    actual_current_loc = work_order.get_current_location() if work_order.jobs or work_order.multi_job_legs else plane.current_location
+                    job_start = best_job.legs[0]['from_icao'] if best_job.legs else best_job.departure
+                    print(f"      Second pass adding job: {job_start} -> {best_job.destination} (plane at: {actual_current_loc}, local var: {current_location})")
+                
+                # CRITICAL: Verify route continuity before adding job
+                actual_current_loc = work_order.get_current_location() if work_order.jobs or work_order.multi_job_legs else plane.current_location
+                job_start = best_job.legs[0]['from_icao'] if best_job.legs else best_job.departure
+                if job_start.upper() != actual_current_loc.upper():
+                    print(f"      WARNING: Second pass tried to add job starting at {job_start} but plane is at {actual_current_loc}")
+                    break
                 
                 # Add the job
                 work_order.add_job(best_job, work_order.total_hours)
@@ -1605,40 +1668,45 @@ class WorkOrderGenerator:
     
     def _remove_trailing_transit_legs(self, work_order: WorkOrder) -> None:
         """Remove trailing transit legs from work order since they provide no Pay/XP value."""
-        if not work_order.jobs:
+        if not work_order.execution_order:
             return
         
-        # Debug: Show jobs before removing trailing transit legs
-        if 'ANT-07' in str(work_order.jobs[0].job_id if work_order.jobs else ''):
-            pass
-            for i, job in enumerate(work_order.jobs):
-                if hasattr(job, 'legs') and job.legs:
-                    from_loc = job.legs[0]['from_icao']
-                    to_loc = job.destination
-                    print(f"      {i+1}. {from_loc} -> {to_loc} ({job.source})")
+        # Debug: Show execution_order before removing trailing transit legs
+        if 'SKY' in str(work_order.plane_registration) or 'HERC' in str(work_order.plane_registration):
+            print(f"      Before removing trailing transit:")
+            for i, (item_type, item) in enumerate(work_order.execution_order):
+                if item_type == "job":
+                    print(f"        {i+1}. JOB: {item.departure} -> {item.destination} ({item.source})")
+                else:
+                    print(f"        {i+1}. MULTI-LEG: {item.from_icao} -> {item.to_icao}")
         
-        # Remove transit legs from the end of the work order
+        # Remove transit legs from the end of the execution_order (not just jobs list)
         removed_count = 0
-        while work_order.jobs and work_order.jobs[-1].source == "transit":
-            removed_job = work_order.jobs.pop()
-            removed_count += 1
-            # Update totals
-            work_order.total_hours -= removed_job.flight_hours
-            work_order.total_pay -= removed_job.pay
-            work_order.total_xp -= removed_job.xp
-            work_order.total_adjusted_pay -= removed_job.adjusted_pay_total
+        while work_order.execution_order and work_order.execution_order[-1][0] == "job":
+            item_type, last_job = work_order.execution_order[-1]
+            if last_job.source == "transit":
+                work_order.execution_order.pop()
+                work_order.jobs.remove(last_job)
+                removed_count += 1
+                # Update totals
+                work_order.total_hours -= last_job.flight_hours
+                work_order.total_pay -= last_job.pay
+                work_order.total_xp -= last_job.xp
+                work_order.total_adjusted_pay -= last_job.adjusted_pay_total
+            else:
+                break
         
         # Debug: Show jobs after removing trailing transit legs
-        if 'ANT-07' in str(work_order.jobs[0].job_id if work_order.jobs else '') and removed_count > 0:
-            pass
-            for i, job in enumerate(work_order.jobs):
-                if hasattr(job, 'legs') and job.legs:
-                    from_loc = job.legs[0]['from_icao']
-                    to_loc = job.destination
-                    print(f"      {i+1}. {from_loc} -> {to_loc} ({job.source})")
+        if ('SKY' in str(work_order.plane_registration) or 'HERC' in str(work_order.plane_registration)) and removed_count > 0:
+            print(f"      After removing {removed_count} trailing transit(s):")
+            for i, (item_type, item) in enumerate(work_order.execution_order):
+                if item_type == "job":
+                    print(f"        {i+1}. JOB: {item.departure} -> {item.destination} ({item.source})")
+                else:
+                    print(f"        {i+1}. MULTI-LEG: {item.from_icao} -> {item.to_icao}")
         
-        # Recalculate totals to ensure consistency
-        self._recalculate_work_order_totals(work_order)
+        # DON'T recalculate totals here - we only removed items from the end
+        # Calling _recalculate_work_order_totals rebuilds execution_order and loses mid-sequence transits!
     
     def _optimize_work_order_second_pass(self, work_order: WorkOrder, plane: PlaneInfo,
                                         current_location: str, max_hours: float, 
@@ -1683,11 +1751,29 @@ class WorkOrderGenerator:
         if len(work_order.jobs) <= 1:
             return
         
+        # CRITICAL: Do not optimize if there are multi-job legs
+        # Multi-job legs are not in work_order.jobs, only in execution_order
+        # Reordering work_order.jobs would break the execution_order
+        if work_order.multi_job_legs:
+            print(f"      Skipping penalty optimization due to multi-job legs present")
+            return
+        
+        # Save original state in case we need to revert
+        original_jobs = list(work_order.jobs)
+        original_execution_order = list(work_order.execution_order)
+        
         pass
+        
+        # CRITICAL: Identify jobs that are part of multi-job legs - they must never be reordered
+        multi_leg_job_ids = set()
+        for item_type, item in work_order.execution_order:
+            if item_type == "multi_leg":
+                for job in item.jobs:
+                    multi_leg_job_ids.add(job.job_id)
         
         # Group consecutive jobs by departure/destination
         groups = []
-        current_group = [work_order.jobs[0]]
+        current_group = [work_order.jobs[0]] if work_order.jobs[0].job_id not in multi_leg_job_ids else []
         
         # Debug: Show job grouping process
         pass
@@ -1701,6 +1787,20 @@ class WorkOrderGenerator:
             prev_job = work_order.jobs[i-1]
             curr_job = work_order.jobs[i]
             
+            # CRITICAL: Jobs that are part of multi-job legs must not be grouped for reordering
+            if curr_job.job_id in multi_leg_job_ids:
+                # End current group if it has multiple jobs
+                if len(current_group) > 1:
+                    groups.append(current_group)
+                # Don't start a new group with a multi-leg job
+                current_group = []
+                continue
+            
+            # Also end groups if previous job was part of a multi-leg
+            if prev_job.job_id in multi_leg_job_ids:
+                current_group = [curr_job]
+                continue
+            
             # Use consistent departure/destination logic for comparison
             prev_from = prev_job.legs[0]['from_icao'] if prev_job.legs else prev_job.departure
             prev_to = prev_job.legs[-1]['to_icao'] if prev_job.legs else prev_job.destination
@@ -1708,6 +1808,7 @@ class WorkOrderGenerator:
             curr_to = curr_job.legs[-1]['to_icao'] if curr_job.legs else curr_job.destination
             
             # Check if jobs have same departure and destination
+            # Transit jobs naturally won't match this pattern since they have different routes
             if prev_from == curr_from and prev_to == curr_to:
                 current_group.append(curr_job)
                 pass
@@ -1775,6 +1876,15 @@ class WorkOrderGenerator:
                     new_jobs.append(job)
                     i += 1
             
+            # CRITICAL: Before modifying work_order.jobs, verify route continuity
+            # Build a temporary execution_order to check
+            temp_execution_order = self._build_execution_order_from_jobs(new_jobs, work_order)
+            
+            # Check route continuity
+            if not self._verify_route_continuity(temp_execution_order):
+                print(f"      Reverting job reordering due to route continuity issues")
+                return  # Don't modify anything
+            
             # Replace the work order jobs with the reordered list
             work_order.jobs = new_jobs
             pass
@@ -1783,14 +1893,85 @@ class WorkOrderGenerator:
         pass
         
         # Recalculate totals and penalties with correct accumulated times after reordering
-        self._recalculate_work_order_totals(work_order)
+        self._recalculate_work_order_totals(work_order, original_jobs, original_execution_order)
     
-    def _recalculate_work_order_totals(self, work_order: WorkOrder) -> None:
+    def _build_execution_order_from_jobs(self, jobs_list: List[JobInfo], work_order: WorkOrder) -> List[Tuple[str, Any]]:
+        """Build execution_order from a reordered jobs list, preserving multi-job legs."""
+        new_execution_order = []
+        jobs_added = set()
+        multi_leg_map = {}
+        
+        # First, identify which jobs belong to multi-job legs
+        for item_type, item in work_order.execution_order:
+            if item_type == "multi_leg":
+                for job in item.jobs:
+                    multi_leg_map[job.job_id] = item
+        
+        # Build execution order from jobs_list
+        for job in jobs_list:
+            if job.job_id in multi_leg_map:
+                # This job is part of a multi-leg
+                leg = multi_leg_map[job.job_id]
+                if leg not in [item for _, item in new_execution_order if _ == "multi_leg"]:
+                    # Add the multi-leg only once (first time we encounter any job from it)
+                    new_execution_order.append(("multi_leg", leg))
+                    jobs_added.update(j.job_id for j in leg.jobs)
+            else:
+                # Single job
+                if job.job_id not in jobs_added:
+                    new_execution_order.append(("job", job))
+                    jobs_added.add(job.job_id)
+        
+        return new_execution_order
+    
+    def _verify_route_continuity(self, execution_order: List[Tuple[str, Any]]) -> bool:
+        """Verify that all jobs in execution_order maintain route continuity."""
+        prev_dest = None
+        for item_type, item in execution_order:
+            if item_type == "job":
+                if prev_dest is not None and item.departure.upper() != prev_dest.upper():
+                    return False
+                prev_dest = item.destination
+            elif item_type == "multi_leg":
+                if prev_dest is not None and item.from_icao.upper() != prev_dest.upper():
+                    return False
+                prev_dest = item.to_icao
+        return True
+    
+    def _recalculate_work_order_totals(self, work_order: WorkOrder, 
+                                       original_jobs: Optional[List[JobInfo]] = None,
+                                       original_execution_order: Optional[List[Tuple[str, Any]]] = None) -> None:
         """Recalculate work order totals after job reordering."""
         work_order.total_hours = 0.0
         work_order.total_pay = 0.0
         work_order.total_xp = 0.0
         work_order.total_adjusted_pay = 0.0
+        
+        # CRITICAL: Do NOT rebuild execution_order if there are multi-job legs
+        # Multi-job legs are not in work_order.jobs, so rebuilding from jobs would lose them
+        if work_order.multi_job_legs:
+            # Just recalculate totals from existing execution_order without rebuilding it
+            accumulated_hours = 0.0
+            for item_type, item in work_order.execution_order:
+                if item_type == "job":
+                    job = item
+                    accumulated_hours += job.flight_hours
+                    job.penalty_amount = work_order._calculate_penalty(job, accumulated_hours)
+                    job.adjusted_pay_total = job.pay - job.penalty_amount
+                    job.adjusted_pay_per_hour = job.adjusted_pay_total / job.flight_hours if job.flight_hours > 0 else 0.0
+                    work_order.total_hours += job.flight_hours
+                    work_order.total_pay += job.pay
+                    work_order.total_xp += job.xp
+                    work_order.total_adjusted_pay += job.adjusted_pay_total
+                elif item_type == "multi_leg":
+                    leg = item
+                    accumulated_hours += leg.flight_hours
+                    work_order.total_hours += leg.flight_hours
+                    for job in leg.jobs:
+                        work_order.total_pay += job.pay
+                        work_order.total_xp += job.xp
+                        work_order.total_adjusted_pay += job.adjusted_pay_total
+            return
         
         # Rebuild execution_order preserving the positions of multi-job legs
         # Create a mapping from job_id to the reordered job object
@@ -1823,6 +2004,31 @@ class WorkOrderGenerator:
                     new_execution_order.append(("job", job))
                     jobs_added.add(job.job_id)
         
+        # CRITICAL: Verify route continuity BEFORE applying changes (only when called from penalty optimization)
+        # After reordering, jobs might not connect properly
+        if original_jobs is not None and original_execution_order is not None:
+            prev_dest = None
+            route_broken = False
+            for item_type, item in new_execution_order:
+                if item_type == "job":
+                    if prev_dest is not None and item.departure != prev_dest:
+                        print(f"      WARNING: Route continuity broken! Job {item.job_id[:5]} starts at {item.departure} but previous ended at {prev_dest}")
+                        route_broken = True
+                    prev_dest = item.destination
+                elif item_type == "multi_leg":
+                    if prev_dest is not None and item.from_icao != prev_dest:
+                        print(f"      WARNING: Route continuity broken! Multi-leg starts at {item.from_icao} but previous ended at {prev_dest}")
+                        route_broken = True
+                    prev_dest = item.to_icao
+            
+            # If route is broken, restore original state
+            if route_broken:
+                print(f"      Reverting job reordering due to route continuity issues")
+                work_order.jobs = original_jobs
+                work_order.execution_order = original_execution_order
+                return  # Don't recalculate, keep original order
+        
+        # Only apply changes if route continuity is maintained (or check was skipped)
         work_order.execution_order = new_execution_order
         
         # Recalculate totals and penalties in execution order
