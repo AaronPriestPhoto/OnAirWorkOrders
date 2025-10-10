@@ -200,7 +200,7 @@ def main():
 		# Generate work orders automatically (unless disabled)
 		if not args.no_work_orders:
 			print("Generating work orders...")
-			from work_order_generator import WorkOrderGenerator, PerformanceOptimizer, export_to_excel, open_file
+			from work_order_generator import WorkOrderGenerator, PerformanceOptimizer, export_to_excel, open_file, load_fbo_mapping
 			from onair.config import load_config as load_wo_config
 			import os
 			
@@ -221,9 +221,13 @@ def main():
 			generator = WorkOrderGenerator(wo_config.db_path, optimizer, enable_penalty_optimization=True)
 			work_orders = generator.generate_all_work_orders(max_hours=24.0, epsilon_hours=0.5)
 			
+			# Load FBO mapping for translating UUIDs to names
+			print("Loading FBO information...")
+			fbo_mapping = load_fbo_mapping(wo_config)
+			
 			# Export work orders to Excel
 			output_file = "workorders.xlsx"
-			if export_to_excel(work_orders, output_file):
+			if export_to_excel(work_orders, output_file, fbo_mapping):
 				print(f"Work orders saved to: {output_file}")
 				# Auto-open the file
 				print("Opening file...")
@@ -397,7 +401,7 @@ def main():
 	# Generate work orders automatically (unless disabled)
 	if not args.no_work_orders:
 		print("Generating work orders...")
-		from work_order_generator import WorkOrderGenerator, PerformanceOptimizer, export_to_excel, open_file
+		from work_order_generator import WorkOrderGenerator, PerformanceOptimizer, export_to_excel, open_file, load_fbo_mapping
 		from onair.config import load_config as load_wo_config
 		import os
 		
@@ -418,9 +422,13 @@ def main():
 		generator = WorkOrderGenerator(wo_config.db_path, optimizer, enable_penalty_optimization=True)
 		work_orders = generator.generate_all_work_orders(max_hours=24.0, epsilon_hours=0.5)
 		
+		# Load FBO mapping for translating UUIDs to names
+		print("Loading FBO information...")
+		fbo_mapping = load_fbo_mapping(wo_config)
+		
 		# Export work orders to Excel
 		output_file = "workorders.xlsx"
-		if export_to_excel(work_orders, output_file):
+		if export_to_excel(work_orders, output_file, fbo_mapping):
 			print(f"Work orders saved to: {output_file}")
 			# Auto-open the file
 			print("Opening file...")
