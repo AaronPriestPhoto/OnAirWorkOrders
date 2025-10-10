@@ -42,6 +42,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 from onair.config import load_config
 from onair import db as db_mod
+from onair.api import OnAirClient
 from performance_optimizer import PerformanceOptimizer
 
 
@@ -113,6 +114,33 @@ def open_file(file_path: str) -> bool:
     except Exception as e:
         print(f"Warning: Could not auto-open file: {e}")
         return False
+
+
+# ----------------------------
+# FBO Loading
+# ----------------------------
+def load_fbo_mapping(config) -> Dict[str, str]:
+    """
+    Load FBOs from the API and create a mapping from FBO UUID to FBO name.
+    Returns empty dict on error or if run_mode is offline.
+    """
+    if config.run_mode == "offline":
+        return {}
+    
+    try:
+        client = OnAirClient(config)
+        fbos = client.list_fbos()
+        mapping = {}
+        for fbo in fbos:
+            fbo_id = fbo.get('Id')
+            fbo_name = fbo.get('Name')
+            if fbo_id and fbo_name:
+                mapping[fbo_id] = fbo_name
+        print(f"Loaded {len(mapping)} FBOs for source translation")
+        return mapping
+    except Exception as e:
+        print(f"Warning: Could not load FBOs from API: {e}")
+        return {}
 
 
 @dataclass
@@ -2363,8 +2391,11 @@ def format_excel_workbook(wb, ws):
         return False
 
 
-def export_to_excel(work_orders: List[WorkOrder], excel_path: str) -> bool:
+def export_to_excel(work_orders: List[WorkOrder], excel_path: str, fbo_mapping: Dict[str, str] = None) -> bool:
     """Export work orders to Excel with formatting. Returns True if successful."""
+    if fbo_mapping is None:
+        fbo_mapping = {}
+    
     wb, ws = create_excel_workbook()
     if not wb or not ws:
         return False
@@ -2385,7 +2416,8 @@ def export_to_excel(work_orders: List[WorkOrder], excel_path: str) -> bool:
                     # Transformations
                     display_source = job.source
                     if isinstance(display_source, str) and display_source.startswith('fbo:'):
-                        display_source = (job.departure or '').strip().upper()
+                        fbo_uuid = display_source[4:]  # Remove 'fbo:' prefix
+                        display_source = fbo_mapping.get(fbo_uuid, (job.departure or '').strip().upper())
                     display_job_id = (job.job_id or '')[:5]
 
                     row_data = [
@@ -2432,7 +2464,8 @@ def export_to_excel(work_orders: List[WorkOrder], excel_path: str) -> bool:
                         is_late = accumulated_hours > job.time_remaining_hours
                         display_source = job.source
                         if isinstance(display_source, str) and display_source.startswith('fbo:'):
-                            display_source = (leg.from_icao or '').strip().upper()
+                            fbo_uuid = display_source[4:]  # Remove 'fbo:' prefix
+                            display_source = fbo_mapping.get(fbo_uuid, (leg.from_icao or '').strip().upper())
                         display_job_id = (job.job_id or '')[:5]
 
                         row_data = [
@@ -2532,6 +2565,10 @@ def main():
     
     # Export to file by default (unless --no-export is specified)
     if not args.no_export and work_orders:
+        # Load FBO mapping for translating UUIDs to names
+        print("Loading FBO information...")
+        fbo_mapping = load_fbo_mapping(config)
+        
         # Ensure output file has correct extension based on format
         output_file = args.output
         if args.format == "excel" and not output_file.endswith('.xlsx'):
@@ -2549,9 +2586,9 @@ def main():
         # Export based on format
         success = False
         if args.format == "excel":
-            success = export_to_excel(work_orders, output_file)
+            success = export_to_excel(work_orders, output_file, fbo_mapping)
         else:  # csv
-            success = export_to_csv(work_orders, output_file)
+            success = export_to_csv(work_orders, output_file, fbo_mapping)
         
         if success:
             print(f"Work orders exported successfully to: {output_file}")
@@ -2571,8 +2608,11 @@ def main():
     return 0
 
 
-def export_to_csv(work_orders: List[WorkOrder], csv_path: str) -> bool:
+def export_to_csv(work_orders: List[WorkOrder], csv_path: str, fbo_mapping: Dict[str, str] = None) -> bool:
     """Export work orders to CSV with safe file operations. Returns True if successful."""
+    if fbo_mapping is None:
+        fbo_mapping = {}
+    
     import csv
     
     def write_csv_operation():
@@ -2604,7 +2644,8 @@ def export_to_csv(work_orders: List[WorkOrder], csv_path: str) -> bool:
                     is_late = accumulated_hours > job.time_remaining_hours
                     display_source = job.source
                     if isinstance(display_source, str) and display_source.startswith('fbo:'):
-                        display_source = (job.departure or '').strip().upper()
+                        fbo_uuid = display_source[4:]  # Remove 'fbo:' prefix
+                        display_source = fbo_mapping.get(fbo_uuid, (job.departure or '').strip().upper())
                     display_job_id = (job.job_id or '')[:5]
 
                     all_rows.append([
@@ -2648,7 +2689,8 @@ def export_to_csv(work_orders: List[WorkOrder], csv_path: str) -> bool:
                         is_late = accumulated_hours > job.time_remaining_hours
                         display_source = job.source
                         if isinstance(display_source, str) and display_source.startswith('fbo:'):
-                            display_source = (leg.from_icao or '').strip().upper()
+                            fbo_uuid = display_source[4:]  # Remove 'fbo:' prefix
+                            display_source = fbo_mapping.get(fbo_uuid, (leg.from_icao or '').strip().upper())
                         display_job_id = (job.job_id or '')[:5]
 
                         all_rows.append([
