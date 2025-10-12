@@ -1775,15 +1775,10 @@ class WorkOrderGenerator:
         
         Only sorts jobs that have the same departure and destination to avoid
         breaking the sequential chaining requirement.
-        """
-        if len(work_order.jobs) <= 1:
-            return
         
-        # CRITICAL: Do not optimize if there are multi-job legs
-        # Multi-job legs are not in work_order.jobs, only in execution_order
-        # Reordering work_order.jobs would break the execution_order
-        if work_order.multi_job_legs:
-            print(f"      Skipping penalty optimization due to multi-job legs present")
+        Works with execution_order to properly handle multi-job legs.
+        """
+        if len(work_order.execution_order) <= 1:
             return
         
         # Save original state in case we need to revert
@@ -1792,128 +1787,130 @@ class WorkOrderGenerator:
         
         pass
         
-        # CRITICAL: Identify jobs that are part of multi-job legs - they must never be reordered
-        multi_leg_job_ids = set()
-        for item_type, item in work_order.execution_order:
-            if item_type == "multi_leg":
-                for job in item.jobs:
-                    multi_leg_job_ids.add(job.job_id)
+        # Helper function to get departure/destination for any execution item
+        def get_route(item_type: str, item: Any) -> Tuple[str, str]:
+            if item_type == "job":
+                from_loc = item.legs[0]['from_icao'] if item.legs else item.departure
+                to_loc = item.legs[-1]['to_icao'] if item.legs else item.destination
+                return from_loc.upper(), to_loc.upper()
+            elif item_type == "multi_leg":
+                return item.from_icao.upper(), item.to_icao.upper()
+            return "", ""
         
-        # Group consecutive jobs by departure/destination
-        groups = []
-        current_group = [work_order.jobs[0]] if work_order.jobs[0].job_id not in multi_leg_job_ids else []
+        # Helper function to get minimum time remaining for sorting
+        def get_min_time_remaining(item_type: str, item: Any) -> float:
+            if item_type == "job":
+                return item.time_remaining_hours
+            elif item_type == "multi_leg":
+                # For multi-job legs, use the minimum time remaining among all jobs
+                return min(job.time_remaining_hours for job in item.jobs) if item.jobs else float('inf')
+            return float('inf')
         
-        # Debug: Show job grouping process
+        # Debug: Show execution order items
         pass
-        for i, job in enumerate(work_order.jobs):
-            # Use consistent departure/destination logic
-            from_loc = job.legs[0]['from_icao'] if job.legs else job.departure
-            to_loc = job.legs[-1]['to_icao'] if job.legs else job.destination
-            print(f"      Job {i+1}: {from_loc} -> {to_loc} ({job.source}) [time_remaining: {job.time_remaining_hours:.1f}h]")
+        for i, (item_type, item) in enumerate(work_order.execution_order):
+            from_loc, to_loc = get_route(item_type, item)
+            min_time = get_min_time_remaining(item_type, item)
+            print(f"      Item {i+1} ({item_type}): {from_loc} -> {to_loc} [min_time_remaining: {min_time:.1f}h]")
         
-        for i in range(1, len(work_order.jobs)):
-            prev_job = work_order.jobs[i-1]
-            curr_job = work_order.jobs[i]
+        # Group consecutive items in execution_order by departure/destination
+        groups = []
+        if work_order.execution_order:
+            current_group = [work_order.execution_order[0]]
             
-            # CRITICAL: Jobs that are part of multi-job legs must not be grouped for reordering
-            if curr_job.job_id in multi_leg_job_ids:
-                # End current group if it has multiple jobs
-                if len(current_group) > 1:
-                    groups.append(current_group)
-                # Don't start a new group with a multi-leg job
-                current_group = []
-                continue
+            for i in range(1, len(work_order.execution_order)):
+                prev_type, prev_item = work_order.execution_order[i-1]
+                curr_type, curr_item = work_order.execution_order[i]
+                
+                prev_from, prev_to = get_route(prev_type, prev_item)
+                curr_from, curr_to = get_route(curr_type, curr_item)
+                
+                # Check if items have same departure and destination
+                if prev_from == curr_from and prev_to == curr_to:
+                    current_group.append(work_order.execution_order[i])
+                else:
+                    # End current group and start new one
+                    if len(current_group) > 1:
+                        groups.append(current_group)
+                    current_group = [work_order.execution_order[i]]
             
-            # Also end groups if previous job was part of a multi-leg
-            if prev_job.job_id in multi_leg_job_ids:
-                current_group = [curr_job]
-                continue
-            
-            # Use consistent departure/destination logic for comparison
-            prev_from = prev_job.legs[0]['from_icao'] if prev_job.legs else prev_job.departure
-            prev_to = prev_job.legs[-1]['to_icao'] if prev_job.legs else prev_job.destination
-            curr_from = curr_job.legs[0]['from_icao'] if curr_job.legs else curr_job.departure
-            curr_to = curr_job.legs[-1]['to_icao'] if curr_job.legs else curr_job.destination
-            
-            # Check if jobs have same departure and destination
-            # Transit jobs naturally won't match this pattern since they have different routes
-            if prev_from == curr_from and prev_to == curr_to:
-                current_group.append(curr_job)
-                pass
-            else:
-                # End current group and start new one
-                if len(current_group) > 1:
-                    groups.append(current_group)
-                    pass
-                current_group = [curr_job]
-                pass
-        
-        # Add the last group if it has multiple jobs
-        if len(current_group) > 1:
-            groups.append(current_group)
+            # Add the last group if it has multiple items
+            if len(current_group) > 1:
+                groups.append(current_group)
         
         # Debug: Show groups found
         pass
+        for i, group in enumerate(groups):
+            print(f"      Group {i}: {len(group)} items")
         
         # Sort each group by time remaining (ascending = most urgent first)
         for i, group in enumerate(groups):
             pass
-            original_order = [f"{j.job_id[:8]}...({j.time_remaining_hours:.1f}h)" for j in group]
-            group.sort(key=lambda j: j.time_remaining_hours)
-            sorted_order = [f"{j.job_id[:8]}...({j.time_remaining_hours:.1f}h)" for j in group]
+            original_order = []
+            for item_type, item in group:
+                min_time = get_min_time_remaining(item_type, item)
+                if item_type == "job":
+                    original_order.append(f"job:{item.job_id[:8]}...({min_time:.1f}h)")
+                else:
+                    original_order.append(f"multi_leg({len(item.jobs)} jobs, {min_time:.1f}h)")
+            
+            group.sort(key=lambda x: get_min_time_remaining(x[0], x[1]))
+            
+            sorted_order = []
+            for item_type, item in group:
+                min_time = get_min_time_remaining(item_type, item)
+                if item_type == "job":
+                    sorted_order.append(f"job:{item.job_id[:8]}...({min_time:.1f}h)")
+                else:
+                    sorted_order.append(f"multi_leg({len(item.jobs)} jobs, {min_time:.1f}h)")
+            
             print(f"      Original: {original_order}")
             print(f"      Sorted:   {sorted_order}")
         
-        # Rebuild the job list maintaining the overall order
-        new_jobs = []
-        
-        # Debug: Show what groups were found
-        pass
-        for i, group in enumerate(groups):
-            print(f"      Group {i}: {len(group)} jobs")
-        
-        # CONSERVATIVE APPROACH: Rebuild the job list with sorted groups in correct order
+        # Rebuild execution_order with sorted groups
         if groups:
             pass
             
-            # Create a mapping from job_id to which group it belongs to
-            job_to_group = {}
+            # Create a mapping from execution_order items to which group they belong to
+            item_to_group = {}
             for group in groups:
-                for job in group:
-                    job_to_group[job.job_id] = group
+                for item in group:
+                    # Use id() to uniquely identify the tuple
+                    item_to_group[id(item)] = group
             
-            # Rebuild the job list by walking through original order and inserting sorted groups
-            new_jobs = []
-            i = 0
-            while i < len(work_order.jobs):
-                job = work_order.jobs[i]
+            # Rebuild execution_order by walking through original order and inserting sorted groups
+            new_execution_order = []
+            processed_groups = set()
+            
+            for item in work_order.execution_order:
+                item_id = id(item)
                 
-                if job.job_id in job_to_group:
-                    # This job is part of a group - add the entire sorted group
-                    group = job_to_group[job.job_id]
-                    new_jobs.extend(group)
-                    pass
+                if item_id in item_to_group:
+                    group = item_to_group[item_id]
+                    group_id = id(group)
                     
-                    # Skip all other jobs in this group
-                    for other_job in group:
-                        if other_job.job_id != job.job_id:
-                            i += 1  # Skip this job as it's already in the group
-                    i += 1  # Skip the current job
+                    # Add the entire sorted group only once (first time we encounter any item from it)
+                    if group_id not in processed_groups:
+                        new_execution_order.extend(group)
+                        processed_groups.add(group_id)
                 else:
-                    # This job is not in any group - add it as-is
-                    new_jobs.append(job)
-                    i += 1
-            
-            # CRITICAL: Before modifying work_order.jobs, verify route continuity
-            # Build a temporary execution_order to check
-            temp_execution_order = self._build_execution_order_from_jobs(new_jobs, work_order)
+                    # This item is not in any group - add it as-is
+                    new_execution_order.append(item)
             
             # Check route continuity
-            if not self._verify_route_continuity(temp_execution_order):
+            if not self._verify_route_continuity(new_execution_order):
                 print(f"      Reverting job reordering due to route continuity issues")
                 return  # Don't modify anything
             
-            # Replace the work order jobs with the reordered list
+            # Replace the execution order with the reordered list
+            work_order.execution_order = new_execution_order
+            
+            # Also update work_order.jobs to match the new execution order (excluding multi-job legs)
+            # This is critical because export functions read from work_order.jobs
+            new_jobs = []
+            for item_type, item in new_execution_order:
+                if item_type == "job":
+                    new_jobs.append(item)
             work_order.jobs = new_jobs
             pass
         
