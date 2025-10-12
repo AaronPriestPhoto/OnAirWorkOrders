@@ -164,6 +164,10 @@ def main():
 					help="Include human-only jobs (default: automated only)")
 	parser.add_argument("--no-work-orders", action="store_true",
 					help="Skip automatic work order generation")
+	parser.add_argument("--max-hours", type=float, default=24.0,
+					help="Total hours per plane for work orders (default: 24.0)")
+	parser.add_argument("--epsilon-hours", type=float, default=0.5,
+					help="Small overage allowance for work orders (default: 0.5)")
 	args = parser.parse_args()
 
 	config = cfg_mod.load_config()
@@ -219,7 +223,7 @@ def main():
 			
 			# Generate work orders with default settings (penalty optimization enabled)
 			generator = WorkOrderGenerator(wo_config.db_path, optimizer, enable_penalty_optimization=True)
-			work_orders = generator.generate_all_work_orders(max_hours=24.0, epsilon_hours=0.5)
+			work_orders = generator.generate_all_work_orders(max_hours=args.max_hours, epsilon_hours=args.epsilon_hours)
 			
 			# Load FBO mapping for translating UUIDs to names
 			print("Loading FBO information...")
@@ -420,7 +424,7 @@ def main():
 		
 		# Generate work orders with default settings (penalty optimization enabled)
 		generator = WorkOrderGenerator(wo_config.db_path, optimizer, enable_penalty_optimization=True)
-		work_orders = generator.generate_all_work_orders(max_hours=24.0, epsilon_hours=0.5)
+		work_orders = generator.generate_all_work_orders(max_hours=args.max_hours, epsilon_hours=args.epsilon_hours)
 		
 		# Load FBO mapping for translating UUIDs to names
 		print("Loading FBO information...")

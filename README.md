@@ -14,6 +14,12 @@ https://www.onair.company/
 - Python 3.10+
 - An OnAir API key and Company ID
 
+Clone the repository:
+```bash
+git clone https://github.com/AaronPriestPhoto/OnAirWorkOrders.git
+cd OnAirWorkOrders
+```
+
 Install dependencies:
 ```bash
 pip install -r requirements.txt
