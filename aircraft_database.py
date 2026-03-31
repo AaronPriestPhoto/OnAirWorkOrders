@@ -15,6 +15,15 @@ class OnAirApiError(RuntimeError):
 	pass
 
 
+def _maybe_load_dotenv() -> None:
+	# Use existing .env if present (does nothing if python-dotenv isn't installed).
+	try:
+		from dotenv import load_dotenv  # type: ignore
+	except Exception:
+		return
+	load_dotenv()
+
+
 def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
 	val = os.getenv(name)
 	if val is None:
@@ -174,6 +183,8 @@ def export_aircraft_database_csv(
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
+	_maybe_load_dotenv()
+
 	parser = argparse.ArgumentParser(
 		description="Export OnAir aircraft market-style database to aircraft_database.csv (standalone, MSFS-only by default)."
 	)
